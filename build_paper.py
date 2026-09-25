@@ -898,8 +898,16 @@ def subs_html(subs, today):
 
 
 FONTS = ("https://fonts.googleapis.com/css2?family=Libre+Franklin:wght@400;500;600;700&family=Newsreader:"
-         "ital,opsz,wght@0,6..72,400;0,6..72,500;0,6..72,600;0,6..72,700;1,6..72,400&family=Grenze+Gotisch:wght@700"
+         "ital,opsz,wght@0,6..72,400;0,6..72,500;0,6..72,600;0,6..72,700;1,6..72,400&family=UnifrakturMaguntia"
          "&display=swap")
+# Only the letter y, from the sister typeface (see nameplate()).
+FONTS_Y = "https://fonts.googleapis.com/css2?family=UnifrakturCook:wght@700&text=y&display=swap"
+
+
+def nameplate():
+    """The masthead name. In Fraktur the lowercase y reads like an "ŋ" to modern eyes,
+    so the y alone is set in UnifrakturCook, whose y has a clear descender."""
+    return esc(PAPER).replace("y", '<span class="y">y</span>')
 
 
 def head_html(title, path, prefix, description=DESCRIPTION):
@@ -936,6 +944,7 @@ def head_html(title, path, prefix, description=DESCRIPTION):
 <script type="application/ld+json">{ld}</script>
 <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="{FONTS}">
+<link rel="stylesheet" href="{FONTS_Y}">
 <style>{CSS}</style>
 <script>try{{var t=localStorage.getItem("dl-theme");if(t)document.documentElement.setAttribute("data-theme",t)}}catch(e){{}}</script>"""
 
@@ -1013,7 +1022,7 @@ def render(ctx, prefix, archived):
 {archive_note}
 <header class="mast">
   <div class="mast-top"><span>Vol. I · No. {ctx["no"]}</span><span>{date_long}</span><span>Printed {printed} IST</span></div>
-  <h1 class="nameplate"><a href="{prefix}index.html">{PAPER}</a></h1>
+  <h1 class="nameplate"><a href="{prefix}index.html">{nameplate()}</a></h1>
   <p class="motto">{MOTTO}</p>
   <div class="mast-bottom">{prev_link}<span class="tally">{len(read_ok)} publishers · {ctx["scanned"]:,} stories read · {ctx["printed"]} printed</span><span class="mast-r"><a href="{prefix}archive.html">All editions</a><button id="theme" type="button" aria-label="Switch light or dark">◐</button></span></div>
 </header>
@@ -1058,7 +1067,7 @@ def render_archive(index):
 <html lang="en"><head>
 {head}
 </head><body>
-<header class="mast"><h1 class="nameplate small"><a href="index.html">{PAPER}</a></h1>
+<header class="mast"><h1 class="nameplate small"><a href="index.html">{nameplate()}</a></h1>
 <div class="mast-bottom"><a href="index.html">← Today’s paper</a><span class="tally">All editions</span><span></span></div></header>
 <main class="wrap arch">{"".join(rows)}</main></body></html>
 """
@@ -1137,7 +1146,7 @@ CSS = r"""
 :root{--bg:#f5f0e5;--paper:#fbf8f1;--ink:#1b1a17;--ink2:#3a3731;--muted:#6d675c;--hair:#d8cfbc;--rule:#1b1a17;
 --accent:#9c2b1f;--up:#1c6f45;--down:#ad2a1e;--lock:#86661a;--visited:#7a7468;--wash:rgba(27,26,23,.055);
 --serif:"Newsreader",Georgia,"Times New Roman",serif;--sans:"Libre Franklin","Segoe UI",system-ui,sans-serif;
---black:"Grenze Gotisch","Old English Text MT",Georgia,serif;color-scheme:light}
+--black:"UnifrakturMaguntia","Old English Text MT",Georgia,serif;color-scheme:light}
 @media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#151412;--paper:#1d1c19;--ink:#ece7dc;
 --ink2:#cfc8ba;--muted:#9c9588;--hair:#36332d;--rule:#d9d3c6;--accent:#e58474;--up:#5fc28f;--down:#f08070;
 --lock:#d6b15a;--visited:#8d877b;--wash:rgba(236,231,220,.07);color-scheme:dark}}
@@ -1162,7 +1171,8 @@ a:focus-visible,button:focus-visible,input:focus-visible{outline:2px solid var(-
 .mast{text-align:center;padding-top:14px}
 .mast-top{display:flex;flex-wrap:wrap;justify-content:space-between;gap:4px 16px;font:500 11px/1.4 var(--sans);
 letter-spacing:.09em;text-transform:uppercase;color:var(--muted);border-bottom:1px solid var(--hair);padding-bottom:8px}
-.nameplate{font-family:var(--black);font-weight:700;font-size:clamp(44px,9.5vw,112px);line-height:1.02;margin:14px 0 .12em;letter-spacing:.005em}
+.nameplate{font-family:var(--black);font-weight:400;font-size:clamp(44px,9.5vw,112px);line-height:1.02;margin:14px 0 2px}
+.nameplate .y{font-family:"UnifrakturCook",var(--black);font-weight:700}
 .nameplate.small{font-size:clamp(40px,7vw,72px)}
 .nameplate a{text-decoration:none}
 .motto{font-style:italic;color:var(--ink2);margin:0 0 12px;font-size:15.5px}
