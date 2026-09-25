@@ -1,0 +1,1311 @@
+"""The Daily Ledger - a morning newspaper that prints itself.
+
+Reads headlines and the publisher-written summaries from public RSS feeds,
+groups the same story across papers, sorts everything into sections and
+prints today's edition to index.html (with a dated copy in editions/).
+
+GitHub Actions runs this every morning (.github/workflows/print.yml) and
+publishes the result to GitHub Pages. It is safe to run by hand:
+    python build_paper.py            build today's edition
+    python build_paper.py --open     build, then open it in the browser
+    python build_paper.py --no-wait  don't retry if the network is down
+    python build_paper.py --if-missing  only print if today's edition doesn't exist yet
+
+Standard library only - nothing to install.
+"""
+import gzip
+import html
+import html.entities
+import json
+import math
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
+import zlib
+from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+EDITIONS = ROOT / "editions"
+CACHE = ROOT / "cache"
+LOGS = ROOT / "logs"
+IST = timezone(timedelta(hours=5, minutes=30))
+
+PAPER = "The Daily Ledger"
+MOTTO = "All the news that’s free to read"
+# Where the paper lives online. Absolute links (Google, link previews, the sitemap) start here.
+SITE_URL = os.environ.get("SITE_URL", "https://frosty6699.github.io/daily-ledger/")
+AUTHOR = "frosty6699"
+REPO_URL = "https://github.com/frosty6699/daily-ledger"
+GOOGLE_VERIFICATION = ""  # the code from Search Console's "HTML tag" option, if you verify that way
+DESCRIPTION = ("A free newspaper that prints itself every morning: the day’s top business, markets, "
+               "economy, tech and world stories from The Economic Times, Business Standard, Mint, "
+               "Reuters, WSJ, FT and more — grouped, ranked and linked to the original.")
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/128.0 Safari/537.36")
+GN = "https://news.google.com/rss/search?q={}&hl=en-IN&gl=IN&ceid=IN:en"
+
+# ---------------------------------------------------------------- sources --
+# access: "free"  - open to read
+#         "check" - mixed; each article page is checked for a subscriber flag
+#         "paid"  - subscriber-only; appears as headline + summary with a lock
+# feeds:  (url, section or None to classify by keywords, is a "top stories" feed)
+SOURCES = [
+    {"key": "ET", "name": "The Economic Times", "short": "ET", "access": "check", "feeds": [
+        ("https://economictimes.indiatimes.com/rssfeedstopstories.cms", None, True),
+        ("https://economictimes.indiatimes.com/markets/rssfeeds/1977021501.cms", "markets", False),
+        ("https://economictimes.indiatimes.com/news/economy/rssfeeds/1373380680.cms", "economy", False),
+        ("https://economictimes.indiatimes.com/industry/rssfeeds/13352306.cms", "companies", False),
+        ("https://economictimes.indiatimes.com/tech/rssfeeds/13357270.cms", "tech", False),
+        ("https://economictimes.indiatimes.com/news/international/rssfeeds/858478126.cms", "world", False)]},
+    {"key": "BS", "name": "Business Standard", "short": "BS", "access": "check", "feeds": [
+        ("https://www.business-standard.com/rss/home_page_top_stories.rss", None, True),
+        ("https://www.business-standard.com/rss/latest.rss", None, False),
+        ("https://www.business-standard.com/rss/markets-106.rss", "markets", False),
+        ("https://www.business-standard.com/rss/economy-102.rss", "economy", False),
+        ("https://www.business-standard.com/rss/companies-101.rss", "companies", False),
+        ("https://www.business-standard.com/rss/finance-103.rss", None, False),
+        ("https://www.business-standard.com/rss/technology-108.rss", "tech", False)]},
+    {"key": "Mint", "name": "Mint", "short": "Mint", "access": "check", "feeds": [
+        ("https://www.livemint.com/rss/news", None, True),
+        ("https://www.livemint.com/rss/markets", "markets", False),
+        ("https://www.livemint.com/rss/economy", "economy", False),
+        ("https://www.livemint.com/rss/companies", "companies", False),
+        ("https://www.livemint.com/rss/money", None, False),
+        ("https://www.livemint.com/rss/technology", "tech", False)]},
+    {"key": "BL", "name": "The Hindu BusinessLine", "short": "BusinessLine", "access": "check", "feeds": [
+        ("https://www.thehindubusinessline.com/feeder/default.rss", None, True),
+        ("https://www.thehindubusinessline.com/markets/feeder/default.rss", "markets", False),
+        ("https://www.thehindubusinessline.com/economy/feeder/default.rss", "economy", False),
+        ("https://www.thehindubusinessline.com/companies/feeder/default.rss", "companies", False)]},
+    {"key": "Hindu", "name": "The Hindu (Business)", "short": "The Hindu", "access": "check", "feeds": [
+        ("https://www.thehindu.com/business/feeder/default.rss", None, False)]},
+    {"key": "NDTV", "name": "NDTV Profit", "short": "NDTV Profit", "access": "free", "feeds": [
+        ("https://feeds.feedburner.com/ndtvprofit-latest", None, False)]},
+    {"key": "MC", "name": "Moneycontrol (via Google News)", "short": "Moneycontrol", "access": "free", "gn": True, "feeds": [
+        (GN.format("when:1d+site:moneycontrol.com"), None, False)]},
+    {"key": "FE", "name": "Financial Express (via Google News)", "short": "Fin. Express", "access": "free", "gn": True, "feeds": [
+        (GN.format("when:1d+site:financialexpress.com"), None, False)]},
+    {"key": "Reuters", "name": "Reuters (via Google News)", "short": "Reuters", "access": "free", "gn": True, "feeds": [
+        (GN.format("when:1d+site:reuters.com"), None, False)]},
+    {"key": "CNBC", "name": "CNBC", "short": "CNBC", "access": "check", "feeds": [
+        ("https://www.cnbc.com/id/100003114/device/rss/rss.html", None, True),
+        ("https://www.cnbc.com/id/10001147/device/rss/rss.html", "companies", False),
+        ("https://www.cnbc.com/id/20910258/device/rss/rss.html", "economy", False),
+        ("https://www.cnbc.com/id/10000664/device/rss/rss.html", "markets", False),
+        ("https://www.cnbc.com/id/100727362/device/rss/rss.html", "world", False),
+        ("https://www.cnbc.com/id/19854910/device/rss/rss.html", "tech", False)]},
+    {"key": "BBC", "name": "BBC News", "short": "BBC", "access": "free", "feeds": [
+        ("https://feeds.bbci.co.uk/news/business/rss.xml", None, False),
+        ("https://feeds.bbci.co.uk/news/world/rss.xml", "world", False),
+        ("https://feeds.bbci.co.uk/news/technology/rss.xml", "tech", False)]},
+    {"key": "Guardian", "name": "The Guardian", "short": "Guardian", "access": "free", "feeds": [
+        ("https://www.theguardian.com/uk/business/rss", None, False),
+        ("https://www.theguardian.com/business/economics/rss", "economy", False)]},
+    {"key": "WSJ", "name": "The Wall Street Journal", "short": "WSJ", "access": "paid", "feeds": [
+        ("https://feeds.content.dowjones.io/public/rss/RSSMarketsMain", "markets", True),
+        ("https://feeds.content.dowjones.io/public/rss/WSJcomUSBusiness", "companies", False),
+        ("https://feeds.content.dowjones.io/public/rss/socialeconomyfeed", "economy", False),
+        ("https://feeds.content.dowjones.io/public/rss/RSSWorldNews", "world", False),
+        ("https://feeds.content.dowjones.io/public/rss/RSSWSJD", "tech", False)]},
+    {"key": "FT", "name": "Financial Times", "short": "FT", "access": "paid", "feeds": [
+        ("https://www.ft.com/rss/home", None, True),
+        ("https://www.ft.com/markets?format=rss", "markets", False)]},
+    {"key": "Bloomberg", "name": "Bloomberg", "short": "Bloomberg", "access": "paid", "feeds": [
+        ("https://feeds.bloomberg.com/markets/news.rss", "markets", False)]},
+    {"key": "Economist", "name": "The Economist", "short": "Economist", "access": "paid", "feeds": [
+        ("https://www.economist.com/finance-and-economics/rss.xml", "economy", False)]},
+    {"key": "NYT", "name": "The New York Times", "short": "NYT", "access": "paid", "feeds": [
+        ("https://rss.nytimes.com/services/xml/rss/nyt/Business.xml", None, False)]},
+    {"key": "MW", "name": "MarketWatch", "short": "MarketWatch", "access": "paid", "feeds": [
+        ("https://feeds.content.dowjones.io/public/rss/mw_topstories", "markets", False)]},
+    # Official releases go to the Regulators' desk, not the news sections.
+    {"key": "RBI", "name": "Reserve Bank of India", "short": "RBI", "access": "free", "desk": True, "feeds": [
+        ("https://www.rbi.org.in/pressreleases_rss.xml", None, False),
+        ("https://www.rbi.org.in/notifications_rss.xml", None, False)]},
+    {"key": "Fed", "name": "US Federal Reserve", "short": "Fed", "access": "free", "desk": True, "feeds": [
+        ("https://www.federalreserve.gov/feeds/press_all.xml", None, False)]},
+]
+SRC = {s["key"]: s for s in SOURCES}
+# Whose write-up to lead with when several papers carry the same story.
+PREFER = ["ET", "BS", "Mint", "BL", "Reuters", "CNBC", "BBC", "Guardian", "Hindu", "NDTV", "FE", "MC"]
+
+TICKERS = [  # label, Yahoo symbol, kind
+    ("Nifty 50", "^NSEI", "index"), ("Sensex", "^BSESN", "index"), ("Bank Nifty", "^NSEBANK", "index"),
+    ("USD/INR", "INR=X", "fx"), ("Brent", "BZ=F", "usd"), ("Gold", "GC=F", "usd"),
+    ("S&P 500", "^GSPC", "index"), ("US 10Y", "^TNX", "yield"),
+]
+
+SECTIONS = [  # id, title, story cards, one-line briefs
+    ("markets", "Markets", 7, 10),
+    ("economy", "Economy & Policy", 7, 10),
+    ("companies", "Companies & Deals", 7, 10),
+    ("world", "World", 7, 8),
+    ("tech", "Technology", 5, 6),
+    ("opinion", "Opinion", 5, 0),
+]
+SEC_NAME = {k: v for k, v, _, _ in SECTIONS}
+SUBS_QUOTA = {"WSJ": 6, "FT": 5, "Bloomberg": 4, "Economist": 4, "NYT": 4, "MW": 4, "premium": 6}
+
+KEYWORDS = {
+    "markets": """sensex nifty stock stocks share shares equity equities ipo ipos gmp listing listings bond bonds
+        yield yields treasury treasuries rupee forex dollar currency currencies gold silver crude brent oil
+        commodity commodities fii fiis fpi fpis dii mutual fund funds sip etf etfs nasdaq dow wall street
+        dalal bitcoin crypto rally selloff sell-off derivatives f&o futures midcap smallcap investors
+        brokerage target price buy sell trading traders market markets hedge""",
+    "economy": """rbi repo monetary inflation cpi wpi gdp fiscal deficit budget gst tax taxes finance ministry
+        sitharaman fed federal reserve powell warsh central bank rate hike cut rates interest tariff tariffs
+        trade exports imports export import jobs unemployment payrolls employment economy economic recession
+        policy government ministry cabinet subsidy pli sebi irdai regulator regulation regulatory niti imf
+        world bank reserves liquidity credit msme pmi growth outlook forecast""",
+    "companies": """ltd limited company companies firm ceo cfo md chairman board profit profits revenue earnings
+        results q1 q2 q3 q4 quarterly acquisition acquire acquires merger deal stake order orders contract
+        crore billion million funding startup startups raises valuation layoffs hiring plant factory capacity
+        expansion launch launches sales brand retail airline airlines bank banks insurer insurance nbfc
+        fintech telecom pharma steel cement auto automaker ev realty hotel hotels conglomerate tata reliance
+        adani infosys wipro hdfc icici sbi boeing tesla amazon walmart""",
+    "tech": """ai artificial intelligence genai openai chatgpt anthropic nvidia chip chips semiconductor
+        semiconductors software saas cloud data centre center cyber cybersecurity hack hacked smartphone
+        iphone apple google alphabet microsoft meta 5g quantum robotics tech technology digital""",
+    "world": """world global iran israel gaza china chinese xi trump white house russia ukraine putin pakistan
+        un unga united nations europe eu uk britain japan war ceasefire sanctions summit g20 g7 brics
+        election hormuz houthi middle east nato diplomatic bilateral""",
+}
+KW = {sec: set(words.split()) for sec, words in KEYWORDS.items()}
+SEC_ORDER = ["markets", "economy", "companies", "tech", "world"]
+
+URL_SECTIONS = [("/markets/", "markets"), ("/market/", "markets"), ("/economy/", "economy"),
+                ("/companies/", "companies"), ("/industry/", "companies"), ("/world-news/", "world"),
+                ("/international/", "world"), ("/world/", "world"), ("/technology/", "tech"),
+                ("/tech/", "tech"), ("/info-tech/", "tech")]
+BL_CATS = {"markets": "markets", "stocks": "markets", "commodities": "markets", "economy": "economy",
+           "agri business": "economy", "money & banking": "economy", "companies": "companies",
+           "logistics": "companies", "info-tech": "tech", "science": "tech", "world": "world"}
+DROP_CATS = {"pr release", "letters", "visually"}
+DROP_PATH = re.compile(r"/(sports?|cricket|entertainment|lifestyle|life-style|astrology|horoscope|photos?|"
+                       r"videos?|web-?stories|podcasts?|education|travel|health|food|fashion|books)/")
+DROP_TITLE = re.compile(r"horoscope|rashifal|live stream|live score|wordle|crossword|quiz\b|"
+                        r"\bpodcast\b|in pics|watch video|photos:|^page \d+ of|\barchives?$|"
+                        r"(\bnews\b.*){3}|zodiac|mercury (direct|retrograde)|tarot|numerology|"
+                        r"viral video|shocking video|caught on camera", re.I)
+OPINION_PATH = re.compile(r"/(opinion|columns?|editorials?|commentisfree|views)/")
+
+STOP = set("""a an the of to in on for and or as at by with from is are was were be been being its it this
+    that these those after before over under amid says say said new how why what when where who whom will
+    would may might could can up down into than more most here there check live today updates update news
+    report reports vs via about against off out not no his her their our your you we they he she i do does
+    did has have had just also all any some key top big set get gets amp""".split())
+
+LOCK_SVG = '<svg class="lock" aria-hidden="true"><use href="#lk"/></svg>'
+
+
+# ---------------------------------------------------------------- helpers --
+def log(msg):
+    LOGS.mkdir(exist_ok=True)
+    line = f"{datetime.now(IST):%Y-%m-%d %H:%M:%S}  {msg}"
+    try:
+        print(line)
+    except Exception:
+        pass  # pythonw has no console
+    path = LOGS / "build.log"
+    lines = path.read_text(encoding="utf-8").splitlines()[-600:] if path.exists() else []
+    lines.append(line)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def fetch(url, timeout=20, tries=3):
+    last = None
+    for attempt in range(tries):
+        try:
+            req = urllib.request.Request(url, headers={
+                "User-Agent": UA, "Accept": "*/*", "Accept-Encoding": "gzip, deflate",
+                "Accept-Language": "en-IN,en;q=0.9"})
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                data = r.read()
+                enc = (r.headers.get("Content-Encoding") or "").lower()
+            if enc == "gzip" or data[:2] == b"\x1f\x8b":
+                data = gzip.decompress(data)
+            elif enc == "deflate":
+                try:
+                    data = zlib.decompress(data)
+                except zlib.error:
+                    data = zlib.decompress(data, -zlib.MAX_WBITS)
+            return data
+        except urllib.error.HTTPError as e:
+            last = e
+            if e.code in (401, 403, 410):  # locked or gone for good; 404s are sometimes a blip
+                break
+        except Exception as e:  # timeouts, resets, DNS
+            last = e
+        if attempt + 1 < tries:
+            time.sleep(3)
+    raise last
+
+
+def esc(s):
+    return html.escape(s or "", quote=True)
+
+
+def local(tag):
+    return tag.rsplit("}", 1)[-1] if isinstance(tag, str) else ""
+
+
+def clean(s):
+    s = html.unescape(html.unescape(s or ""))  # a few feeds escape twice
+    s = re.sub(r"<[^>]+>", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def parse_date(s):
+    s = (s or "").strip()
+    if not s:
+        return None
+    try:
+        d = parsedate_to_datetime(s)
+    except Exception:
+        try:
+            d = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        except Exception:
+            return None
+    return d.replace(tzinfo=IST) if d.tzinfo is None else d  # RBI dates carry no zone
+
+
+def trim_dek(s, title, n=270):
+    if not s or s.lower().rstrip(".") == title.lower().rstrip("."):
+        return ""
+    if s.lower().startswith(title.lower()):
+        s = s[len(title):].lstrip(" .:-–—")
+    if len(s) < 25:
+        return ""
+    if len(s) <= n and s[-1] in ".!?”\"'’)":
+        return s
+    cut = s[:n]
+    end = max(cut.rfind(". "), cut.rfind("? "), cut.rfind("! "))
+    if end >= 100:
+        return cut[:end + 1]
+    if len(s) > n:
+        cut = cut.rsplit(" ", 1)[0]
+    return cut.rstrip(" ,;:-–") + "…"  # feed cut the sentence short
+
+
+def better_image(url):
+    if not url or re.search(r"/logo/|default|placeholder|1x1|pixel", url, re.I):
+        return None
+    url = url.replace("&amp;", "&")
+    url = re.sub(r"(ichef\.bbci\.co\.uk/(?:ace/standard|news))/\d+/", r"\1/800/", url)
+    m = re.match(r"https://img\.etimg\.com/photo/msid-(\d+),imgsize-(\d+)\.cms", url)
+    if m:  # ET links full-size originals (often 2-3 MB); ask for a web-sized copy
+        url = (f"https://img.etimg.com/thumb/msid-{m.group(1)},width-960,height-540,"
+               f"imgsize-{m.group(2)},resizemode-4/photo.jpg")
+    return url
+
+
+TRACKING = re.compile(r"^(utm_\w+|mod|oc|ref|src|cmpid|smid|partner|fbclid|gclid|at_\w+|traffic_source|from)$", re.I)
+
+
+def url_key(link):
+    """Same article reached through different feeds -> same key. Keeps real
+    query parameters (RBI's ?prid=) and drops tracking ones (?mod=rss)."""
+    u = urllib.parse.urlsplit(link.strip())
+    query = sorted((k, v) for k, v in urllib.parse.parse_qsl(u.query) if not TRACKING.match(k))
+    host = u.netloc.lower().removeprefix("www.")
+    return f"{host}{u.path.rstrip('/')}?{urllib.parse.urlencode(query)}".lower()
+
+
+def tokens(title):
+    t = title.lower().replace("’", "'").replace("u.s.", "us").replace("s&p", "sp")
+    t = re.sub(r"'s\b", "", t)
+    out = set()
+    for w in re.findall(r"[a-z0-9]+", t):
+        if w in STOP or (len(w) < 2 and not w.isdigit()):
+            continue
+        if len(w) > 4 and w.endswith("s") and not w.endswith("ss"):
+            w = w[:-1]
+        out.add(w)
+    return out
+
+
+def classify(text_title, text_dek):
+    title = " " + re.sub(r"[^a-z0-9&\- ]", " ", text_title.lower()) + " "
+    dek = " " + re.sub(r"[^a-z0-9&\- ]", " ", text_dek.lower()) + " "
+    tw, dw = set(title.split()), set(dek.split())
+    best, best_score = None, 0
+    for sec in SEC_ORDER:
+        score = 2 * len(tw & KW[sec]) + len(dw & KW[sec])
+        if score > best_score:
+            best, best_score = sec, score
+    return best if best_score >= 2 else None
+
+
+# ------------------------------------------------------------------ feeds --
+XML_ENTS = {"amp", "lt", "gt", "quot", "apos"}
+
+
+def parse_xml(data):
+    try:
+        return ET.fromstring(data)
+    except ET.ParseError:
+        pass
+    text = data.decode("utf-8", "replace")
+    head = text[:3000].lower()
+    if "<rss" not in head and "<feed" not in head and "<rdf" not in head:
+        raise ValueError("sent a web page instead of a feed")
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", text)
+    text = re.sub(r"&([A-Za-z][A-Za-z0-9]*);", lambda m: m.group(0) if m.group(1) in XML_ENTS
+                  else "&#%d;" % html.entities.name2codepoint.get(m.group(1), 32), text)
+    text = re.sub(r"&(?![A-Za-z][A-Za-z0-9]*;|#\d+;|#x[0-9A-Fa-f]+;)", "&amp;", text)
+    text = re.sub(r"^\s*<\?xml[^>]*\?>", "", text)
+    return ET.fromstring(text)
+
+
+def feed_entries(root):
+    out = []
+    for it in root.iter():
+        if local(it.tag) not in ("item", "entry"):
+            continue
+        d = {"title": "", "link": "", "desc": "", "date": None, "img": None, "cat": ""}
+        for ch in it:
+            t, txt = local(ch.tag), (ch.text or "").strip()
+            if t == "title":
+                d["title"] = txt
+            elif t == "link" and not d["link"]:
+                d["link"] = txt or ch.get("href", "")
+            elif t in ("description", "summary") and not d["desc"]:
+                d["desc"] = txt
+            elif t in ("pubDate", "published", "updated", "date") and not d["date"]:
+                d["date"] = parse_date(txt)
+            elif t == "category" and not d["cat"]:
+                d["cat"] = clean(txt).lower()
+        best_w = -1
+        for ch in it.iter():
+            t = local(ch.tag)
+            if t not in ("content", "thumbnail", "enclosure") or not ch.get("url"):
+                continue
+            typ, med = (ch.get("type") or "").lower(), (ch.get("medium") or "").lower()
+            if typ.startswith(("video", "audio")) or med in ("video", "audio"):
+                continue
+            if t == "enclosure" and typ and not typ.startswith("image"):
+                continue
+            w = int(re.sub(r"\D", "", ch.get("width") or "") or 0)
+            if w > best_w:
+                best_w, d["img"] = w, ch.get("url")
+        if not d["img"]:
+            m = re.search(r'<img[^>]+src="([^"]+)"', d["desc"])
+            d["img"] = m.group(1) if m else None
+        out.append(d)
+    return out
+
+
+def load_source(src):
+    """Fetch every feed of one publisher. Returns (entries, errors)."""
+    entries, errors = [], []
+    for url, section, is_top in src["feeds"]:
+        try:
+            for e in feed_entries(parse_xml(fetch(url))):
+                e.update(feed_section=section, top=is_top)
+                entries.append(e)
+        except Exception as ex:
+            errors.append(f"{type(ex).__name__}: {str(ex)[:90]}")
+    return src["key"], entries, errors
+
+
+def fetch_quote(ticker):
+    label, sym, kind = ticker
+    try:
+        url = ("https://query1.finance.yahoo.com/v8/finance/chart/"
+               f"{urllib.parse.quote(sym)}?range=5d&interval=1d")
+        r = json.loads(fetch(url, timeout=12))["chart"]["result"][0]
+        closes = [c for c in r["indicators"]["quote"][0]["close"] if c is not None]
+        price = r["meta"].get("regularMarketPrice") or closes[-1]
+        prev = closes[-2] if len(closes) >= 2 else r["meta"].get("chartPreviousClose")
+        return {"label": label, "kind": kind, "price": float(price), "prev": float(prev)}
+    except Exception:
+        return None
+
+
+# --------------------------------------------------------------- paywalls --
+def page_locked(item):
+    """True if the article page itself says it is for subscribers."""
+    url = item["link"]
+    if item["src"] == "ET" and "/prime/" in url:
+        return True
+    try:
+        page = fetch(url, timeout=15, tries=1).decode("utf-8", "replace")  # hundreds of these; no retries
+    except Exception:
+        return False  # can't tell - treat as free
+    if item["src"] == "BS":
+        m = re.search(r'"isPaid"\s*:\s*"([YN])"', page)
+        if m:
+            return m.group(1) == "Y"
+    m = re.search(r'"isAccessibleForFree"\s*:\s*"?([^",}\s]+)', page)
+    return bool(m and "false" in m.group(1).lower())
+
+
+def check_paywalls(items):
+    path = CACHE / "paywall.json"
+    CACHE.mkdir(exist_ok=True)
+    try:
+        cache = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        cache = {}
+    now = time.time()
+    cache = {u: v for u, v in cache.items() if now - v[1] < 10 * 86400}
+    todo = [it for it in items if it["link"] not in cache]
+    if todo:
+        with ThreadPoolExecutor(16) as ex:
+            for it, locked in zip(todo, ex.map(page_locked, todo)):
+                cache[it["link"]] = [locked, now]
+    for it in items:
+        it["locked"] = cache[it["link"]][0]
+    path.write_text(json.dumps(cache), encoding="utf-8")
+    return len(todo)
+
+
+# ------------------------------------------------------------- the paper --
+def collect(now):
+    with ThreadPoolExecutor(20) as ex:
+        feeds = list(ex.map(load_source, SOURCES))
+        quotes = [q for q in ex.map(fetch_quote, TICKERS) if q]
+    status, items, desk, seen = {}, [], defaultdict(list), set()
+    window = now - timedelta(hours=30)
+    raw_count = 0
+    for key, entries, errors in feeds:
+        src = SRC[key]
+        status[key] = {"ok": bool(entries), "errors": errors, "n": 0}
+        for e in entries:
+            title = clean(e["title"])
+            link = (e["link"] or "").strip()
+            if not title or not link.startswith("http"):
+                continue
+            if src.get("gn"):
+                title = re.sub(r"\s+-\s+[^-]{2,40}$", "", title)
+            ukey = url_key(link)
+            if ukey in seen:
+                continue
+            seen.add(ukey)
+            date = e["date"] or now
+            if date > now + timedelta(hours=1):
+                date = now
+            if src.get("desk"):
+                desk[key].append({"title": title, "link": link, "date": date})
+                continue
+            raw_count += 1
+            if date < window:
+                continue
+            desc = "" if src.get("gn") else trim_dek(clean(e["desc"]), title)
+            path = urllib.parse.urlparse(link).path.lower()
+            if DROP_PATH.search(path) or DROP_TITLE.search(title) or e["cat"] in DROP_CATS:
+                continue
+            section, weight = e["feed_section"], 2
+            if OPINION_PATH.search(path) or e["cat"] == "opinion":
+                section = "opinion"
+            elif not section:
+                weight = 1
+                section = BL_CATS.get(e["cat"]) if key == "BL" else None
+                if not section:
+                    section = next((s for frag, s in URL_SECTIONS if frag in path), None)
+                if not section:
+                    section = classify(title, desc)
+                if not section:
+                    continue  # general news with nothing business about it
+            items.append({
+                "src": key, "title": title, "link": link, "desc": desc, "date": date,
+                "img": better_image(e["img"]), "section": section, "weight": weight,
+                "top": e["top"], "paid": src["access"] == "paid", "check": src["access"] == "check",
+                "locked": src["access"] == "paid", "tok": tokens(title)})
+            status[key]["n"] += 1
+    for key in desk:
+        desk[key].sort(key=lambda d: d["date"], reverse=True)
+    return items, desk, quotes, status, raw_count
+
+
+def similar(a, b):
+    inter = len(a & b)
+    if inter < 2:
+        return 0
+    jac = inter / len(a | b)
+    ovl = inter / min(len(a), len(b))
+    if jac >= 0.5 or (inter >= 4 and ovl >= 0.6) or (inter >= 3 and ovl >= 0.8):
+        return jac + 0.01 * inter
+    return 0
+
+
+def cluster(items):
+    clusters, index = [], defaultdict(set)
+    for it in sorted(items, key=lambda x: x["date"], reverse=True):
+        hits = Counter(cid for tok in it["tok"] for cid in index[tok])
+        best, best_sim = None, 0
+        for cid, n in hits.items():
+            if n < 2:
+                continue
+            s = max(similar(it["tok"], m["tok"]) for m in clusters[cid])
+            if s > best_sim:
+                best, best_sim = cid, s
+        if best is None:
+            best = len(clusters)
+            clusters.append([])
+        clusters[best].append(it)
+        for tok in it["tok"]:
+            index[tok].add(best)
+    return [{"members": m} for m in clusters]
+
+
+def score(c, now):
+    mem = c["members"]
+    free = {m["src"] for m in mem if not m["paid"]}
+    paid = {m["src"] for m in mem if m["paid"]}
+    newest = max(m["date"] for m in mem)
+    age = (now - newest).total_seconds() / 3600
+    votes = Counter()
+    for m in mem:
+        votes[m["section"]] += m["weight"]
+    order = SEC_ORDER + ["opinion"]
+    c["section"] = max(votes, key=lambda s: (votes[s], -order.index(s)))
+    if c["section"] == "opinion" and len(free | paid) > 1:
+        rest = Counter({s: v for s, v in votes.items() if s != "opinion"})
+        if rest:
+            c["section"] = max(rest, key=lambda s: (rest[s], -order.index(s)))
+    c["date"] = newest
+    c["sources"] = free | paid
+    c["score"] = (2.0 * len(free) + 1.2 * len(paid) + (1.0 if any(m["top"] for m in mem) else 0)
+                  + 2.0 * max(0.0, 1 - age / 30) + (0.4 if any(m["desc"] for m in mem) else 0))
+
+
+def finish(c):
+    """Pick the free write-up to lead with, the image and the source chips."""
+    mem = c["members"]
+    free = [m for m in mem if not m["locked"]]
+    rank = lambda m: (PREFER.index(m["src"]) if m["src"] in PREFER else 99, -m["date"].timestamp())
+    # The headline closest to what everyone else wrote says what the story is.
+    central = lambda m: round(sum(len(m["tok"] & o["tok"]) / (len(m["tok"] | o["tok"]) or 1)
+                                  for o in mem if o is not m) / max(len(mem) - 1, 1), 1)
+    with_dek = sorted((m for m in free if len(m["desc"]) >= 60), key=lambda m: (-central(m), rank(m)))
+    c["primary"] = with_dek[0] if with_dek else (sorted(free, key=rank)[0] if free else None)
+    lead = c["primary"] or sorted(mem, key=lambda m: -m["date"].timestamp())[0]
+    c["img"] = lead["img"] or next((m["img"] for m in mem if m["img"]), None)
+    chips, seen = [], set()
+    for m in sorted(mem, key=lambda m: (m is not lead, m["locked"], rank(m))):
+        if m["src"] not in seen:
+            seen.add(m["src"])
+            chips.append(m)
+    c["chips"] = chips
+    c["related"] = []
+    c["ptok"] = lead["tok"]
+    c["utok"] = set().union(*(m["tok"] for m in mem))
+
+
+# Daily formats every paper runs; one of each is enough.
+SERIES = [(re.compile(p, re.I), key) for p, key in [
+    (r"(stock market|share market|sensex|nifty|markets?)\b.*\blive\b|\blive\b.*(sensex|nifty|stock market)", "live"),
+    (r"stocks? to (watch|buy|sell)|stocks in (news|focus)|buzzing stocks|stock picks", "watch"),
+    (r"(petrol|diesel|fuel) (and diesel )?prices? today", "fuel"),
+    (r"(gold|silver) (rate|price)s? today|today'?s? (gold|silver) (rate|price)", "bullion"),
+    (r"\bipo\b.*\b(gmp|subscri\w*|allotment|opens|day \d|price band)\b", "ipo"),
+]]
+# Numbers, units and dates say nothing about whether two stories are the same.
+THREAD_IGNORE = set("""cr crore crores lakh rs bn mn billion million trillion pc bps percent per cent day days
+    week weeks month months year years quarter today tomorrow yesterday january february march april june july
+    august september october november december monday tuesday wednesday thursday friday saturday sunday
+    likely amid ahead high higher highest low lower lowest rise rising fall falling jump surge surging gain
+    drop hit hits seen see set plan eye look first last next record strong weak major near back fresh deep
+    move push pushe focus know need want expert experts analyst analysts rate""".split())
+
+
+SERIES_NAME = {"live": "Markets Live", "watch": "Stocks to Watch", "fuel": "Fuel Prices",
+               "bullion": "Gold & Silver", "ipo": "IPO Watch"}
+
+
+def series(title):
+    return next((key for rx, key in SERIES if rx.search(title)), None)
+
+
+def thread(clusters, idf):
+    """Fold follow-ups of the same news (different angles, different headlines)
+    into the strongest story as 'more on this' links. Expects clusters ranked.
+    Words most headlines use today (India, stake, Trump...) don't count as
+    evidence; rare ones (Sanofi, IRDAI, PMS) do."""
+    useful = lambda toks: {t for t in toks if t not in THREAD_IGNORE and not t.isdigit()}
+    rare = lambda toks, cut=5.0: {t for t in toks if idf.get(t, 9) >= cut}
+    live = [c for c in clusters if c["primary"]]
+    for c in live:
+        c["series"] = series(c["primary"]["title"])
+        c["ptok_t"] = useful(c["ptok"])
+        c["urare"] = rare(useful(c["utok"]))
+    folded = set()
+    for i, a in enumerate(live):
+        if id(a) in folded:
+            continue
+        for b in live[i + 1:]:
+            if id(b) in folded:
+                continue
+            if a["series"] or b["series"]:
+                same = a["series"] == b["series"]
+            else:
+                shared = a["ptok_t"] & b["ptok_t"]
+                weight = sum(idf.get(t, 9) for t in shared)
+                same_sec = a["section"] == b["section"]
+                # headline match: 3+ telling words, or 2 distinctive ones in the same section
+                by_headline = rare(shared, 4.0) and weight >= 10 and (
+                    len(shared) >= 3 or (same_sec and len(rare(shared)) == 2 == len(shared)))
+                # thread match: a distinctive word in common and 3+ across all the coverage
+                by_thread = (same_sec and len(shared) >= 2 and rare(shared)
+                             and len(a["urare"] & b["urare"]) >= 3)
+                same = bool(by_headline or by_thread)
+            if same:
+                a["related"].append(b)
+                folded.add(id(b))
+        a["score"] += 0.7 * min(len(a["related"]), 4)
+    kept = [c for c in clusters if id(c) not in folded]
+    kept.sort(key=lambda c: c["score"], reverse=True)
+    return kept
+
+
+def too_close(a, b, idf):
+    """Same broad topic - keeps one event from taking over the front page."""
+    topical = lambda toks: {t for t in toks if idf.get(t, 9) >= 2.4 and t not in THREAD_IGNORE}
+    shared = len(topical(a["ptok"] & b["ptok"]))
+    return shared >= 2 or (shared == 1 and len(topical(a["utok"] & b["utok"])) >= 3)
+
+
+def assemble(items, now):
+    clusters = cluster(items)
+    for c in clusters:
+        score(c, now)
+    clusters.sort(key=lambda c: c["score"], reverse=True)
+
+    # Check the articles that could make the paper for a subscriber flag.
+    by_sec = defaultdict(list)
+    for c in clusters:
+        by_sec[c["section"]].append(c)
+    shortlist = {id(c): c for c in clusters[:40]}
+    for sec_list in by_sec.values():
+        shortlist.update({id(c): c for c in sec_list[:40]})
+    to_check = [m for c in shortlist.values() for m in c["members"] if m["check"]]
+    checked = check_paywalls(to_check)
+    for c in clusters:
+        finish(c)
+    df = Counter(t for it in items for t in it["tok"])
+    idf = {t: math.log(len(items) / n) for t, n in df.items()}
+    clusters = thread(clusters, idf)
+    by_sec = defaultdict(list)
+    for c in clusters:
+        by_sec[c["section"]].append(c)
+
+    used, front, sections, per_sec = set(), [], {}, Counter()
+    for c in clusters:
+        if len(front) == 8:
+            break
+        if (c["primary"] and c["section"] != "opinion" and per_sec[c["section"]] < 3
+                and not any(too_close(c, f, idf) for f in front)):
+            front.append(c)
+            used.add(id(c))
+            per_sec[c["section"]] += 1
+    # Lead: the strongest of the top three that has a picture.
+    lead_i = next((i for i, c in enumerate(front[:3]) if c["img"]), 0)
+    if front:
+        front.insert(0, front.pop(lead_i))
+
+    for sec, _, n_cards, n_briefs in SECTIONS:
+        pool = [c for c in by_sec.get(sec, []) if c["primary"] and id(c) not in used]
+        cards = pool[:n_cards]
+        feat = next((i for i, c in enumerate(cards[:4])
+                     if c["img"] and c["primary"]["desc"] and not c.get("series")), None)
+        if feat:
+            cards.insert(0, cards.pop(feat))
+        briefs = pool[n_cards:n_cards + n_briefs]
+        sections[sec] = (cards, briefs)
+        used.update(id(c) for c in cards + briefs)
+
+    subs = defaultdict(list)
+    for c in clusters:
+        if c["primary"] is None:
+            m = sorted(c["members"], key=lambda m: (not m["desc"], -m["date"].timestamp()))[0]
+            group = m["src"] if m["paid"] else "premium"
+            if len(subs[group]) < SUBS_QUOTA.get(group, 4):
+                subs[group].append((m, c))
+    return front, sections, subs, len(clusters), checked
+
+
+# ------------------------------------------------------------------- HTML --
+def fmt_time(d, today):
+    d = d.astimezone(IST)
+    t = d.strftime("%I:%M %p").lstrip("0")
+    if d.date() == today:
+        return t
+    if d.date() == today - timedelta(days=1):
+        return "Yesterday " + t
+    return f"{d.day} {d:%b}"
+
+
+def search_text(c):
+    p = c["primary"]
+    names = " ".join(SRC[m["src"]]["short"] + " " + SRC[m["src"]]["name"] for m in c["chips"])
+    more = " ".join(r["primary"]["title"] for r in c.get("related", []))
+    return f"{p['title']} {p['desc']} {names} {more}".lower()
+
+
+def more_html(c, n):
+    rel = c.get("related", [])[:n]
+    if not rel:
+        return ""
+    lis = "".join(f'<li><a href="{esc(r["primary"]["link"])}" target="_blank" rel="noopener">'
+                  f'{esc(r["primary"]["title"])}</a><span class="ms">{esc(SRC[r["primary"]["src"]]["short"])}'
+                  f'</span></li>' for r in rel)
+    return f'<ul class="more" aria-label="More on this story">{lis}</ul>'
+
+
+def meta_html(c, today, max_chips=6):
+    chips = []
+    for m in c["chips"][:max_chips]:
+        s = SRC[m["src"]]
+        tip = s["name"] + (" — subscriber article" if m["locked"] else "")
+        chips.append(f'<a class="src{" locked" if m["locked"] else ""}" href="{esc(m["link"])}" '
+                     f'target="_blank" rel="noopener" title="{esc(tip)}">{esc(s["short"])}'
+                     f'{LOCK_SVG if m["locked"] else ""}</a>')
+    if len(c["chips"]) > max_chips:
+        chips.append(f'<span>+{len(c["chips"]) - max_chips}</span>')
+    n = len(c["sources"])
+    cov = f'<span class="cov">{n} papers</span>' if n >= 3 else ""
+    when = c["primary"]["date"]
+    return (f'<p class="meta">{"<span class=sep>·</span>".join(chips)}{cov}'
+            f'<time datetime="{when.isoformat()}">{fmt_time(when, today)}</time></p>')
+
+
+def story_html(c, today, cls="story", img=False, kicker=None, tag="h3", more=2):
+    p = c["primary"]
+    out = [f'<article class="{cls}" data-s="{esc(search_text(c))}">']
+    if img and c["img"]:
+        out.append(f'<a class="fig" href="{esc(p["link"])}" target="_blank" rel="noopener" tabindex="-1" '
+                   f'aria-hidden="true"><img src="{esc(c["img"])}" alt="" loading="lazy" '
+                   f'referrerpolicy="no-referrer" onerror="this.parentNode.remove()"></a>')
+    if kicker:
+        out.append(f'<p class="kicker">{esc(kicker)}</p>')
+    out.append(f'<{tag} class="hl"><a href="{esc(p["link"])}" target="_blank" rel="noopener">'
+               f'{esc(p["title"])}</a></{tag}>')
+    if p["desc"]:
+        out.append(f'<p class="dek">{esc(p["desc"])}</p>')
+    out.append(meta_html(c, today))
+    out.append(more_html(c, more))
+    out.append("</article>")
+    return "".join(out)
+
+
+def brief_html(c, today):
+    p = c["primary"]
+    return (f'<li data-s="{esc(search_text(c))}"><a href="{esc(p["link"])}" target="_blank" rel="noopener">'
+            f'{esc(p["title"])}</a>{meta_html(c, today, max_chips=3)}</li>')
+
+
+def ticker_html(quotes):
+    if not quotes:
+        return ""
+    cells = ['<span class="tk tk-label">Last<br>close</span>']
+    for q in quotes:
+        price, prev, kind = q["price"], q["prev"], q["kind"]
+        if kind == "yield":
+            val, chg = f"{price:.2f}%", f"{abs(price - prev) * 100:.0f} bp"
+        else:
+            pct = abs(price / prev - 1) * 100 if prev else 0
+            val = (f"${price:,.2f}" if kind == "usd" and price < 1000 else f"${price:,.0f}" if kind == "usd"
+                   else f"₹{price:.2f}" if kind == "fx" else f"{price:,.2f}")
+            chg = f"{pct:.2f}%"
+        cls = "up" if price > prev else "down" if price < prev else "flat"
+        arrow = "▲" if cls == "up" else "▼" if cls == "down" else "●"
+        cells.append(f'<span class="tk"><b>{esc(q["label"])}</b><span><span class="v">{val}</span>'
+                     f'<span class="{cls}">{arrow} {chg}</span></span></span>')
+    return f'<div class="ticker" aria-label="Markets at last close"><div class="ticker-in">{"".join(cells)}</div></div>'
+
+
+def desk_html(desk, today):
+    blocks = []
+    for key, n in (("RBI", 6), ("Fed", 4)):
+        rows = desk.get(key, [])[:n]
+        if not rows:
+            continue
+        lis = "".join(
+            f'<li data-s="{esc((d["title"] + " " + SRC[key]["name"]).lower())}"><a href="{esc(d["link"])}" '
+            f'target="_blank" rel="noopener">{esc(d["title"])}</a>'
+            f'<p class="meta"><time>{fmt_time(d["date"], today)}</time></p></li>' for d in rows)
+        blocks.append(f'<h3 class="desk-h">{esc(SRC[key]["name"])}</h3><ul class="plain">{lis}</ul>')
+    return "".join(blocks)
+
+
+def subs_html(subs, today):
+    names = {"premium": "Premium stories from other papers"}
+    out = []
+    for group in ["WSJ", "FT", "Bloomberg", "Economist", "NYT", "MW", "premium"]:
+        rows = subs.get(group)
+        if not rows:
+            continue
+        title = names.get(group) or SRC[group]["name"]
+        lis = []
+        for m, c in rows:
+            s = SRC[m["src"]]
+            label = f'<span>{esc(s["short"])}</span><span class="sep">·</span>' if group == "premium" else ""
+            dek = f'<p class="dek">{esc(m["desc"])}</p>' if m["desc"] else ""
+            lis.append(f'<li data-s="{esc((m["title"] + " " + m["desc"] + " " + s["name"]).lower())}">'
+                       f'<a href="{esc(m["link"])}" target="_blank" rel="noopener">{esc(m["title"])}</a>{dek}'
+                       f'<p class="meta">{label}<time>{fmt_time(m["date"], today)}</time></p></li>')
+        out.append(f'<div class="pub"><h3 class="desk-h">{LOCK_SVG}{esc(title)}</h3>'
+                   f'<ul class="plain">{"".join(lis)}</ul></div>')
+    return "".join(out)
+
+
+FONTS = ("https://fonts.googleapis.com/css2?family=Libre+Franklin:wght@400;500;600;700&family=Newsreader:"
+         "ital,opsz,wght@0,6..72,400;0,6..72,500;0,6..72,600;0,6..72,700;1,6..72,400&family=UnifrakturMaguntia"
+         "&display=swap")
+
+
+def head_html(title, path, prefix, description=DESCRIPTION):
+    """Everything in <head>: what Google, link previews and phones read."""
+    url = SITE_URL + path
+    ld = json.dumps({"@context": "https://schema.org", "@type": "WebSite", "name": PAPER, "url": SITE_URL,
+                     "description": DESCRIPTION, "inLanguage": "en-IN",
+                     "creator": {"@type": "Person", "name": AUTHOR, "url": f"https://github.com/{AUTHOR}"}},
+                    ensure_ascii=False).replace("</", "<\\/")
+    verify = (f'<meta name="google-site-verification" content="{esc(GOOGLE_VERIFICATION)}">\n'
+              if GOOGLE_VERIFICATION else "")
+    return f"""<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>{esc(title)}</title>
+<meta name="description" content="{esc(description)}">
+<meta name="robots" content="index, follow, max-image-preview:large">
+<link rel="canonical" href="{esc(url)}">
+{verify}<meta property="og:type" content="website">
+<meta property="og:site_name" content="{PAPER}">
+<meta property="og:title" content="{esc(title)}">
+<meta property="og:description" content="{esc(description)}">
+<meta property="og:url" content="{esc(url)}">
+<meta property="og:image" content="{SITE_URL}assets/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="theme-color" content="#f5f0e5" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#151412" media="(prefers-color-scheme: dark)">
+<link rel="icon" type="image/png" sizes="32x32" href="{prefix}assets/favicon-32.png">
+<link rel="apple-touch-icon" href="{prefix}assets/apple-touch-icon.png">
+<link rel="manifest" href="{prefix}assets/manifest.webmanifest">
+<meta name="apple-mobile-web-app-title" content="Ledger">
+<script type="application/ld+json">{ld}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="{FONTS}">
+<style>{CSS}</style>
+<script>try{{var t=localStorage.getItem("dl-theme");if(t)document.documentElement.setAttribute("data-theme",t)}}catch(e){{}}</script>"""
+
+
+def render(ctx, prefix, archived):
+    today, now = ctx["today"], ctx["now"]
+    front, sections = ctx["front"], ctx["sections"]
+    nav = [("front", "Front Page")] + [(k, v) for k, v, _, _ in SECTIONS if sections.get(k, ([], []))[0]]
+    nav += [("desk", "Regulators"), ("subs", "Subscriber Desk")]
+
+    body = []
+    if front:
+        lead = story_html(front[0], today, "story lead", img=True, kicker=SEC_NAME[front[0]["section"]],
+                          tag="h2", more=4)
+        side = "".join(story_html(c, today, kicker=SEC_NAME[c["section"]]) for c in front[1:4])
+        row = "".join(story_html(c, today, img=True, kicker=SEC_NAME[c["section"]]) for c in front[4:8])
+        body.append(f'<section id="front" class="front" data-sec><div class="front-top">{lead}'
+                    f'<div class="front-side">{side}</div></div><div class="front-row">{row}</div></section>')
+    for sec, title, _, _ in SECTIONS:
+        cards, briefs = sections.get(sec, ([], []))
+        if not cards:
+            continue
+        label = lambda c: SERIES_NAME.get(c.get("series"))
+        feat = story_html(cards[0], today, "story feature", img=True, tag="h3", more=3, kicker=label(cards[0]))
+        rest = "".join(story_html(c, today, kicker=label(c), more=4 if label(c) else 2) for c in cards[1:])
+        br = ""
+        if briefs:
+            br = (f'<div class="briefs"><h3 class="small-h">Also in {esc(title)}</h3><ul class="brief-list">'
+                  f'{"".join(brief_html(c, today) for c in briefs)}</ul></div>')
+        count = len(cards) + len(briefs)
+        body.append(f'<section id="{sec}" class="sec" data-sec><header class="sec-head"><h2>{esc(title)}</h2>'
+                    f'<span class="sec-note">{count} stories</span></header>'
+                    f'<div class="sec-body">{feat}{rest}</div>{br}</section>')
+    body.append(f'<section class="band"><div id="desk" class="reg" data-sec><header class="sec-head">'
+                f'<h2>From the Regulators</h2><span class="sec-note">Official releases</span></header>'
+                f'{desk_html(ctx["desk"], today)}</div>'
+                f'<div id="subs" class="subs" data-sec><header class="sec-head"><h2>Subscriber Desk</h2>'
+                f'<span class="sec-note">{LOCK_SVG} Behind a paywall — headline and summary only</span>'
+                f'</header><div class="subs-grid">{subs_html(ctx["subs"], today)}</div></div></section>')
+
+    st = ctx["status"]
+    read_ok = [k for k in st if st[k]["ok"]]
+    failed = [k for k in st if not st[k]["ok"]]
+    src_list = "".join(
+        f'<li><span>{esc(SRC[k]["name"])}{LOCK_SVG if SRC[k]["access"] == "paid" else ""}</span>'
+        f'<span class="n">{st[k]["n"] or len(ctx["desk"].get(k, []))}</span></li>' for k in read_ok)
+    fail_note = ""
+    if failed:
+        fail_note = ("<p>Didn’t answer this morning: "
+                     + ", ".join(esc(SRC[k]["name"]) for k in failed) + ".</p>")
+    printed = f"{now:%I:%M %p}".lstrip("0")
+    date_long = f"{now:%A}, {now.day} {now:%B %Y}"
+    prev_link = (f'<a href="{prefix}editions/{ctx["prev"]}.html">‹ Previous edition</a>'
+                 if ctx["prev"] else '<span class="muted">First edition</span>')
+    archive_note = ""
+    if archived:
+        archive_note = (f'<div class="note">You’re reading the edition of {date_long}. '
+                        f'<a href="{prefix}index.html">Today’s paper →</a></div>')
+    if archived:
+        lead = front[0]["primary"]["title"] if front else ""
+        head = head_html(f"{PAPER} — {date_long} edition", f"editions/{today.isoformat()}.html", prefix,
+                         f"The {date_long} edition of {PAPER}: {lead}, and the day’s other top business, "
+                         f"markets and world stories.")
+    else:
+        head = head_html(f"{PAPER} — India & world business news, every morning", "", prefix)
+
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+{head}
+</head>
+<body data-built="{now.isoformat()}"{' data-archived="1"' if archived else ''}>
+<svg width="0" height="0" style="position:absolute"><symbol id="lk" viewBox="0 0 16 16"><path d="M5 7V5.2a3 3 0 0 1 6 0V7" fill="none" stroke="currentColor" stroke-width="1.7"/><rect x="3" y="7" width="10" height="8" rx="1.6" fill="currentColor"/></symbol></svg>
+<div class="stale" id="stale" hidden></div>
+{archive_note}
+<header class="mast">
+  <div class="mast-top"><span>Vol. I · No. {ctx["no"]}</span><span>{date_long}</span><span>Printed {printed} IST</span></div>
+  <h1 class="nameplate"><a href="{prefix}index.html">{PAPER}</a></h1>
+  <p class="motto">{MOTTO}</p>
+  <div class="mast-bottom">{prev_link}<span class="tally">{len(read_ok)} publishers · {ctx["scanned"]:,} stories read · {ctx["printed"]} printed</span><span class="mast-r"><a href="{prefix}archive.html">All editions</a><button id="theme" type="button" aria-label="Switch light or dark">◐</button></span></div>
+</header>
+{ticker_html(ctx["quotes"])}
+<nav class="secnav" aria-label="Sections"><div class="secnav-in"><div class="links">{"".join(f'<a href="#{k}">{esc(v)}</a>' for k, v in nav)}</div>
+<label class="search"><span class="sr">Search today’s paper</span><input id="q" type="search" placeholder="Search  /" autocomplete="off"></label><span id="qn" class="qn" aria-live="polite"></span></div></nav>
+<main class="wrap">
+{"".join(body)}
+</main>
+<footer class="foot">
+  <div class="foot-grid">
+    <div><h3 class="small-h">About this paper</h3>
+      <p>{PAPER} prints itself every morning at about 6 AM India time. A small program reads the public RSS feeds of 20 publishers, keeps what’s free to read, puts the same story from different papers together, and links every headline to the original article. Nothing here gets around a paywall: locked stories show only the headline and summary the publisher shares for free.</p>
+      <p>Headlines, summaries and pictures belong to their publishers. The paper covers the last 30 hours; pictures are shown in black and white (hover to see colour), and links you’ve opened turn grey.</p>
+      {fail_note}</div>
+    <div><h3 class="small-h">Read this morning</h3><ul class="srcs">{src_list}</ul></div>
+  </div>
+  <p class="colophon">Printed {date_long}, {printed} IST · {ctx["clusters"]:,} distinct stories found · Made by <a href="https://github.com/{AUTHOR}">{AUTHOR}</a> · <a href="{REPO_URL}">How it works</a></p>
+</footer>
+<script>{JS}</script>
+</body>
+</html>
+"""
+
+
+def render_archive(index):
+    rows, month = [], None
+    for date in sorted(index, reverse=True):
+        e = index[date]
+        d = datetime.strptime(date, "%Y-%m-%d")
+        m = f"{d:%B %Y}"
+        if m != month:
+            rows.append(f'<h2 class="arch-m">{m}</h2>')
+            month = m
+        rows.append(f'<a class="arch-row" href="editions/{date}.html"><span class="arch-d">{d:%a} {d.day}</span>'
+                    f'<span class="arch-l">{esc(e.get("lead", ""))}</span>'
+                    f'<span class="arch-n">No. {e.get("no", "")} · {e.get("printed", 0)} stories</span></a>')
+    head = head_html(f"{PAPER} — All editions", "archive.html", "",
+                     f"Every edition of {PAPER}, the free morning newspaper of business, markets and world news.")
+    return f"""<!doctype html>
+<html lang="en"><head>
+{head}
+</head><body>
+<header class="mast"><h1 class="nameplate small"><a href="index.html">{PAPER}</a></h1>
+<div class="mast-bottom"><a href="index.html">← Today’s paper</a><span class="tally">All editions</span><span></span></div></header>
+<main class="wrap arch">{"".join(rows)}</main></body></html>
+"""
+
+
+def render_sitemap(index):
+    """The list of pages Google should know about (submit it once in Search Console)."""
+    latest = max(index) if index else datetime.now(IST).date().isoformat()
+    urls = [(SITE_URL, latest, "daily", "1.0"), (SITE_URL + "archive.html", latest, "daily", "0.6")]
+    urls += [(f"{SITE_URL}editions/{d}.html", d, "never", "0.4") for d in sorted(index, reverse=True)]
+    rows = "".join(f"<url><loc>{esc(u)}</loc><lastmod>{m}</lastmod><changefreq>{f}</changefreq>"
+                   f"<priority>{p}</priority></url>\n" for u, m, f, p in urls)
+    return ('<?xml version="1.0" encoding="UTF-8"?>\n'
+            f'<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n{rows}</urlset>\n')
+
+
+def write(path, text):
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def main():
+    args = set(sys.argv[1:])
+    EDITIONS.mkdir(exist_ok=True)
+    if "--if-missing" in args and (EDITIONS / f"{datetime.now(IST).date().isoformat()}.html").exists():
+        return 0  # the logon / noon catch-up runs: today's paper is already out
+    for attempt in range(5):
+        now = datetime.now(IST)
+        items, desk, quotes, status, raw = collect(now)
+        ok = sum(1 for s in status.values() if s["ok"])
+        if ok >= 6 or "--no-wait" in args:
+            break
+        log(f"only {ok} sources answered - network may be down; retrying in 2 minutes")
+        time.sleep(120)
+    if ok < 6:
+        log("gave up: not enough sources answered; kept yesterday's paper")
+        return 1
+
+    front, sections, subs, n_clusters, checked = assemble(items, now)
+    today = now.date()
+    stamp = today.isoformat()
+    index_path = EDITIONS / "index.json"
+    try:
+        index = json.loads(index_path.read_text(encoding="utf-8"))
+    except Exception:
+        index = {}
+    earlier = sorted(d for d in index if d < stamp)
+    printed = len(front) + sum(len(a) + len(b) for a, b in sections.values())
+    ctx = {"now": now, "today": today, "front": front, "sections": sections, "subs": subs, "desk": desk,
+           "quotes": quotes, "status": status, "scanned": raw, "printed": printed, "clusters": n_clusters,
+           "no": len(earlier) + 1, "prev": earlier[-1] if earlier else None}
+
+    write(EDITIONS / f"{stamp}.html", render(ctx, "../", archived=True))
+    write(ROOT / "index.html", render(ctx, "", archived=False))
+    index[stamp] = {"no": ctx["no"], "printed": printed,
+                    "lead": front[0]["primary"]["title"] if front else ""}
+    write(index_path, json.dumps(index, indent=1))
+    write(ROOT / "archive.html", render_archive(index))
+    write(ROOT / "sitemap.xml", render_sitemap(index))
+
+    failed = [k for k, s in status.items() if not s["ok"]]
+    log(f"printed edition No. {ctx['no']}: {printed} stories from {ok}/{len(status)} publishers, "
+        f"{raw} read, {n_clusters} distinct, {checked} paywall checks"
+        + (f"; no answer from {', '.join(failed)}" if failed else ""))
+    for k, s in status.items():
+        if s["errors"]:
+            log(f"   {k}: {'; '.join(s['errors'][:2])}")
+    if "--open" in args:
+        os.startfile(ROOT / "index.html")
+    return 0
+
+
+# -------------------------------------------------------------------- CSS --
+CSS = r"""
+:root{--bg:#f5f0e5;--paper:#fbf8f1;--ink:#1b1a17;--ink2:#3a3731;--muted:#6d675c;--hair:#d8cfbc;--rule:#1b1a17;
+--accent:#9c2b1f;--up:#1c6f45;--down:#ad2a1e;--lock:#86661a;--visited:#7a7468;
+--serif:"Newsreader",Georgia,"Times New Roman",serif;--sans:"Libre Franklin","Segoe UI",system-ui,sans-serif;
+--black:"UnifrakturMaguntia","Old English Text MT",Georgia,serif;color-scheme:light}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#151412;--paper:#1d1c19;--ink:#ece7dc;
+--ink2:#cfc8ba;--muted:#9c9588;--hair:#36332d;--rule:#d9d3c6;--accent:#e58474;--up:#5fc28f;--down:#f08070;
+--lock:#d6b15a;--visited:#8d877b;color-scheme:dark}}
+:root[data-theme="dark"]{--bg:#151412;--paper:#1d1c19;--ink:#ece7dc;--ink2:#cfc8ba;--muted:#9c9588;--hair:#36332d;
+--rule:#d9d3c6;--accent:#e58474;--up:#5fc28f;--down:#f08070;--lock:#d6b15a;--visited:#8d877b;color-scheme:dark}
+*{box-sizing:border-box}
+html{scroll-padding-top:56px}
+body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--serif);font-size:17px;line-height:1.45;
+-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
+a{color:inherit}
+a:focus-visible,button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}
+.hide{display:none!important}
+.muted{color:var(--muted)}
+.wrap,.mast,.ticker,.foot{max-width:1280px;margin:0 auto;padding-left:16px;padding-right:16px}
+@media(min-width:760px){.wrap,.mast,.ticker,.foot,.secnav-in{padding-left:32px;padding-right:32px}}
+.stale,.note{background:var(--accent);color:#fff;text-align:center;font:600 13px/1.4 var(--sans);padding:9px 16px}
+.note{background:var(--ink);color:var(--bg)}
+.note a{color:inherit;margin-left:8px}
+
+/* masthead */
+.mast{text-align:center;padding-top:14px}
+.mast-top{display:flex;flex-wrap:wrap;justify-content:space-between;gap:4px 16px;font:500 11px/1.4 var(--sans);
+letter-spacing:.09em;text-transform:uppercase;color:var(--muted);border-bottom:1px solid var(--hair);padding-bottom:8px}
+.nameplate{font-family:var(--black);font-weight:400;font-size:clamp(44px,9.5vw,112px);line-height:1.02;margin:14px 0 2px}
+.nameplate.small{font-size:clamp(40px,7vw,72px)}
+.nameplate a{text-decoration:none}
+.motto{font-style:italic;color:var(--ink2);margin:0 0 12px;font-size:15.5px}
+.mast-bottom{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:6px 16px;
+border-top:4px double var(--rule);border-bottom:1px solid var(--rule);padding:7px 0;
+font:600 11.5px/1.4 var(--sans);letter-spacing:.07em;text-transform:uppercase}
+.mast-bottom a{text-decoration:none}.mast-bottom a:hover{color:var(--accent)}
+.tally{color:var(--muted);font-weight:500}
+.mast-r{display:flex;gap:14px;align-items:center}
+#theme{background:none;border:1px solid var(--hair);color:var(--ink);border-radius:50%;width:26px;height:26px;
+font-size:14px;line-height:1;cursor:pointer;padding:0}
+@media(max-width:640px){.mast-top span:first-child,.mast-top span:last-child{display:none}.mast-top{justify-content:center}
+.tally{order:3;width:100%}}
+
+/* ticker */
+.ticker-in{display:flex;overflow-x:auto;scrollbar-width:none;border-bottom:1px solid var(--hair)}
+.ticker-in::-webkit-scrollbar{display:none}
+@media(max-width:1100px){.ticker-in{-webkit-mask-image:linear-gradient(to right,#000 82%,transparent);
+mask-image:linear-gradient(to right,#000 82%,transparent)}}
+.tk{flex:1 0 auto;display:flex;flex-direction:column;gap:1px;padding:8px 14px;border-left:1px solid var(--hair);
+font:500 13px/1.3 var(--sans);white-space:nowrap;font-variant-numeric:tabular-nums}
+.tk:first-child{border-left:0;padding-left:0}
+.tk b{font-weight:600;font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}
+.tk-label{justify-content:center;font-weight:700;font-size:10px;letter-spacing:.09em;text-transform:uppercase;
+color:var(--accent);flex:0 0 auto;line-height:1.25}
+.tk .v{font-weight:600;margin-right:6px}
+.tk .up,.tk .down,.tk .flat{font-size:12px}
+.up{color:var(--up)}.down{color:var(--down)}.flat{color:var(--muted)}
+
+/* section nav */
+.secnav{position:sticky;top:0;z-index:5;background:var(--bg);border-bottom:1px solid var(--rule)}
+.secnav-in{max-width:1280px;margin:0 auto;padding:0 16px;display:flex;align-items:center;gap:14px}
+@media(min-width:760px){.secnav-in{padding:0 32px}}
+.links{display:flex;gap:20px;overflow-x:auto;scrollbar-width:none;flex:1;min-width:0}
+.links::-webkit-scrollbar{display:none}
+.links a{font:600 11.5px/1 var(--sans);text-transform:uppercase;letter-spacing:.08em;text-decoration:none;
+padding:14px 0 12px;white-space:nowrap;border-bottom:2px solid transparent}
+.links a:hover{border-color:var(--accent)}
+.search input{font:14px var(--sans);background:var(--paper);border:1px solid var(--hair);color:var(--ink);
+padding:6px 10px;border-radius:3px;width:190px}
+.qn{font:600 11px var(--sans);color:var(--accent);white-space:nowrap}
+.qn:empty{display:none}
+@media(max-width:640px){.search input{width:104px}}
+
+/* stories */
+.story{margin:0}
+.kicker{font:700 10.5px/1.3 var(--sans);letter-spacing:.1em;text-transform:uppercase;color:var(--accent);margin:0 0 6px}
+.hl{font-family:var(--serif);font-weight:600;font-size:19px;line-height:1.2;margin:0 0 6px;letter-spacing:-.003em}
+.hl a{text-decoration:none}
+.hl a:hover,.brief-list a:hover,.plain a:hover{text-decoration:underline;text-decoration-thickness:1px;text-underline-offset:3px}
+.hl a:visited,.brief-list a:visited,.plain a:visited{color:var(--visited)}
+.dek{margin:0 0 8px;color:var(--ink2);font-size:15.5px;line-height:1.48}
+.meta{font:500 10.5px/1.5 var(--sans);letter-spacing:.06em;text-transform:uppercase;color:var(--muted);
+display:flex;flex-wrap:wrap;align-items:center;gap:2px 6px;margin:0}
+.meta time{white-space:nowrap}
+.src{text-decoration:none;color:var(--ink);font-weight:600}
+.src:hover{color:var(--accent)}
+.src.locked{color:var(--lock)}
+.sep{color:var(--hair)}
+.cov{color:var(--accent);font-weight:700;margin-left:6px}
+.lock{width:.9em;height:.9em;vertical-align:-.1em;margin-left:3px;fill:currentColor}
+.more{list-style:none;margin:9px 0 0;padding:8px 0 0;border-top:1px dotted var(--hair)}
+.more li{position:relative;padding:3px 0 3px 14px;font-size:14.5px;line-height:1.35}
+.more li::before{content:"";position:absolute;left:0;top:.62em;width:6px;height:6px;background:var(--accent)}
+.more a{text-decoration:none;font-weight:500}
+.more a:hover{text-decoration:underline;text-underline-offset:3px}
+.more a:visited{color:var(--visited)}
+.ms{font:600 10px var(--sans);letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin-left:7px}
+.fig{display:block;margin:0 0 10px;overflow:hidden;background:var(--hair)}
+.fig img{display:block;width:100%;aspect-ratio:16/9;object-fit:cover;filter:grayscale(1) contrast(1.06);transition:filter .35s}
+.story:hover .fig img{filter:none}
+
+/* front page */
+.front-top{display:grid;gap:22px;padding:22px 0;border-bottom:1px solid var(--rule)}
+.lead .hl{font-size:clamp(28px,3.3vw,44px);line-height:1.07;font-weight:700;letter-spacing:-.012em;margin:8px 0 10px}
+.lead .dek{font-size:19px;line-height:1.5}
+.front-side .story{padding:0 0 16px;margin-bottom:16px;border-bottom:1px solid var(--hair)}
+.front-side .story:last-child{border-bottom:0;margin-bottom:0;padding-bottom:0}
+.front-side .hl{font-size:22px;line-height:1.16}
+.front-row{display:grid;gap:18px;padding:20px 0 22px;border-bottom:4px double var(--rule)}
+.front-row .story{padding-top:16px;border-top:1px solid var(--hair)}
+.front-row .story:first-child{border-top:0;padding-top:0}
+@media(min-width:700px){.front-row{grid-template-columns:repeat(2,minmax(0,1fr));gap:22px 0}
+.front-row .story{border-top:0;padding:0 22px}.front-row .story:nth-child(odd){padding-left:0}
+.front-row .story:nth-child(even){border-left:1px solid var(--hair);padding-right:0}}
+@media(min-width:1080px){.front-row{grid-template-columns:repeat(4,minmax(0,1fr))}
+.front-row .story,.front-row .story:nth-child(even){padding:0 20px;border-left:1px solid var(--hair)}
+.front-row .story:first-child{padding-left:0;border-left:0}.front-row .story:last-child{padding-right:0}}
+@media(min-width:920px){.front-top{grid-template-columns:minmax(0,7fr) minmax(0,4fr);gap:0}
+.lead{padding-right:28px;border-right:1px solid var(--hair)}.front-side{padding-left:28px}}
+
+/* sections */
+.sec{padding:26px 0 10px;border-bottom:1px solid var(--rule)}
+.sec-head{display:flex;flex-wrap:wrap;align-items:baseline;justify-content:space-between;gap:4px 12px;
+border-top:4px solid var(--rule);padding-top:8px;margin-bottom:18px}
+.sec-head h2{font:700 30px/1.1 var(--serif);letter-spacing:-.01em;margin:0}
+.sec-note{font:500 11px var(--sans);letter-spacing:.07em;text-transform:uppercase;color:var(--muted)}
+.sec-note .lock{color:var(--lock)}
+.sec-body{columns:3 270px;column-gap:44px;column-rule:1px solid var(--hair)}
+.sec-body .story{break-inside:avoid;padding-bottom:15px;margin-bottom:15px;border-bottom:1px solid var(--hair)}
+.feature .hl{font-size:25px;line-height:1.14;font-weight:700}
+.feature .dek{font-size:17px}
+.small-h{font:700 11px/1.3 var(--sans);letter-spacing:.12em;text-transform:uppercase;color:var(--muted);margin:0 0 10px}
+.briefs{margin:10px 0 14px;padding-top:12px;border-top:1px solid var(--hair)}
+.brief-list{list-style:none;margin:0;padding:0;columns:2 320px;column-gap:44px;column-rule:1px solid var(--hair)}
+.brief-list li{break-inside:avoid;padding:7px 0;border-bottom:1px dotted var(--hair)}
+.brief-list li>a{text-decoration:none;font-weight:500;font-size:15.5px;line-height:1.3;display:block;margin-bottom:2px}
+
+/* regulators + subscriber desk */
+.band{display:grid;gap:30px;padding:26px 0 18px;border-bottom:4px double var(--rule)}
+@media(min-width:960px){.band{grid-template-columns:minmax(0,4fr) minmax(0,8fr);gap:0}
+.reg{padding-right:28px;border-right:1px solid var(--hair)}.subs{padding-left:28px}}
+.desk-h{font:700 12px/1.3 var(--sans);letter-spacing:.09em;text-transform:uppercase;margin:4px 0 8px;display:flex;align-items:center;gap:6px}
+.desk-h .lock{margin:0;color:var(--lock)}
+.plain{list-style:none;margin:0 0 18px;padding:0}
+.plain li{padding:8px 0;border-bottom:1px dotted var(--hair)}
+.plain li:last-child{border-bottom:0}
+.plain a{text-decoration:none;font-weight:600;font-size:15.5px;line-height:1.3}
+.plain .dek{font-size:14px;margin:3px 0 3px}
+.subs-grid{columns:2 290px;column-gap:40px;column-rule:1px solid var(--hair)}
+.pub{break-inside:avoid;margin-bottom:10px}
+
+/* footer */
+.foot{padding-top:26px;padding-bottom:56px;font:14px/1.6 var(--sans);color:var(--ink2)}
+.foot-grid{display:grid;gap:26px}
+@media(min-width:860px){.foot-grid{grid-template-columns:minmax(0,5fr) minmax(0,6fr);gap:48px}}
+.foot p{margin:0 0 10px}
+.srcs{list-style:none;margin:0;padding:0;columns:2 210px;column-gap:32px;font-size:13px}
+.srcs li{display:flex;justify-content:space-between;gap:10px;padding:3px 0;border-bottom:1px dotted var(--hair);break-inside:avoid}
+.srcs .n{color:var(--muted);font-variant-numeric:tabular-nums}
+.srcs .lock{color:var(--lock)}
+.colophon{margin-top:22px!important;padding-top:12px;border-top:1px solid var(--hair);font-size:12px;color:var(--muted)}
+
+/* archive */
+.arch{padding-bottom:60px}
+.arch-m{font:700 26px var(--serif);margin:30px 0 8px;padding-top:8px;border-top:4px solid var(--rule)}
+.arch-row{display:grid;grid-template-columns:70px 1fr;gap:2px 16px;padding:11px 0;border-bottom:1px solid var(--hair);text-decoration:none}
+.arch-row:hover .arch-l{text-decoration:underline}
+.arch-d{font:700 12px/1.6 var(--sans);letter-spacing:.07em;text-transform:uppercase;grid-row:span 2}
+.arch-l{font-weight:600;font-size:18px;line-height:1.25}
+.arch-n{font:500 11px var(--sans);letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}
+"""
+
+JS = r"""
+(function(){
+  var root=document.documentElement, body=document.body;
+  var tb=document.getElementById('theme');
+  if(tb) tb.addEventListener('click',function(){
+    var cur=root.getAttribute('data-theme')||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');
+    var next=cur==='dark'?'light':'dark';
+    root.setAttribute('data-theme',next);
+    try{localStorage.setItem('dl-theme',next)}catch(e){}
+  });
+  var built=new Date(body.getAttribute('data-built'));
+  var st=document.getElementById('stale');
+  if(st && !body.hasAttribute('data-archived') && Date.now()-built.getTime()>26*3600*1000){
+    st.textContent='This is the edition of '+built.toLocaleDateString(undefined,{weekday:'long',day:'numeric',month:'long'})+
+      '. Today’s paper is printed at about 6 AM India time — if it’s later than that, try reloading.';
+    st.hidden=false;
+  }
+  var q=document.getElementById('q'), qn=document.getElementById('qn');
+  if(!q) return;
+  var items=[].slice.call(document.querySelectorAll('[data-s]'));
+  var secs=[].slice.call(document.querySelectorAll('[data-sec]'));
+  function run(){
+    var words=q.value.toLowerCase().trim().split(/\s+/).filter(Boolean), n=0;
+    items.forEach(function(el){
+      var s=el.getAttribute('data-s'), ok=words.every(function(w){return s.indexOf(w)>-1});
+      el.classList.toggle('hide',!ok); if(ok&&words.length) n++;
+    });
+    secs.forEach(function(sec){
+      sec.classList.toggle('hide', words.length>0 && !sec.querySelector('[data-s]:not(.hide)'));
+    });
+    qn.textContent=words.length?(n+(n===1?' match':' matches')):'';
+  }
+  q.addEventListener('input',run);
+  document.addEventListener('keydown',function(e){
+    if(e.key==='/'&&document.activeElement!==q){e.preventDefault();q.focus();}
+    else if(e.key==='Escape'&&document.activeElement===q){q.value='';run();q.blur();}
+  });
+})();
+"""
+
+if __name__ == "__main__":
+    sys.exit(main())

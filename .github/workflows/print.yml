@@ -1,0 +1,67 @@
+name: Print the paper
+
+on:
+  schedule:
+    - cron: "37 0 * * *"  # 6:07 AM India time (GitHub sometimes starts scheduled runs a few minutes late)
+    - cron: "7 3 * * *"   # 8:37 AM catch-up: prints only if the morning run didn't
+  workflow_dispatch:       # the "Run workflow" button: print a fresh edition right now
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: print-the-paper
+  cancel-in-progress: false
+
+jobs:
+  print:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Print today's edition
+        env:
+          CATCH_UP: ${{ github.event.schedule == '7 3 * * *' }}
+        run: |
+          if [ "$CATCH_UP" = "true" ]; then
+            python build_paper.py --if-missing
+          else
+            python build_paper.py
+          fi
+          cat logs/build.log 2>/dev/null || true
+
+      - name: Keep the edition in the archive
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add index.html archive.html sitemap.xml editions cache
+          if ! git diff --cached --quiet; then
+            git commit -m "Edition of $(TZ=Asia/Kolkata date +%F)"
+            git pull --rebase --autostash
+            git push
+          fi
+
+      - name: Gather the site
+        run: |
+          mkdir _site
+          cp -r index.html archive.html sitemap.xml editions assets _site/
+          touch _site/.nojekyll
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      - id: deploy
+        uses: actions/deploy-pages@v4
