@@ -1,4 +1,4 @@
-"""The Daily Ledger - a morning newspaper that prints itself.
+"""Frosty's Ledger - a morning newspaper that prints itself.
 
 Reads headlines and the publisher-written summaries from public RSS feeds,
 groups the same story across papers, sorts everything into sections and
@@ -39,12 +39,12 @@ CACHE = ROOT / "cache"
 LOGS = ROOT / "logs"
 IST = timezone(timedelta(hours=5, minutes=30))
 
-PAPER = "The Daily Ledger"
+PAPER = "Frosty’s Ledger"
 MOTTO = "All the news that’s free to read"
 # Where the paper lives online. Absolute links (Google, link previews, the sitemap) start here.
-SITE_URL = os.environ.get("SITE_URL", "https://frosty6699.github.io/daily-ledger/")
+SITE_URL = os.environ.get("SITE_URL", "https://frosty6699.github.io/frostys-ledger/")
 AUTHOR = "frosty6699"
-REPO_URL = "https://github.com/frosty6699/daily-ledger"
+REPO_URL = "https://github.com/frosty6699/frostys-ledger"
 GOOGLE_VERIFICATION = ""  # the code from Search Console's "HTML tag" option, if you verify that way
 DESCRIPTION = ("A free newspaper that prints itself every morning: the day’s top business, markets, "
                "economy, tech and world stories from The Economic Times, Business Standard, Mint, "

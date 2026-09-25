@@ -1,8 +1,8 @@
-# The Daily Ledger
+# Frosty's Ledger
 
-![The Daily Ledger](assets/og.png)
+![Frosty's Ledger](assets/og.png)
 
-**Read it: [frosty6699.github.io/daily-ledger](https://frosty6699.github.io/daily-ledger/)**
+**Read it: [frosty6699.github.io/frostys-ledger](https://frosty6699.github.io/frostys-ledger/)**
 
 A free newspaper that prints itself every morning. At about 6 AM India time, a small Python program
 reads the public RSS feeds of 20 publishers and builds the day's paper. The publishers include
