@@ -418,15 +418,28 @@ def load_source(src):
 
 
 def fetch_quote(ticker):
+    """A year of daily closes: the strip shows the last one, the chart panel all of them."""
     label, sym, kind = ticker
     try:
         url = ("https://query1.finance.yahoo.com/v8/finance/chart/"
-               f"{urllib.parse.quote(sym)}?range=5d&interval=1d")
+               f"{urllib.parse.quote(sym)}?range=1y&interval=1d")
         r = json.loads(fetch(url, timeout=12))["chart"]["result"][0]
-        closes = [c for c in r["indicators"]["quote"][0]["close"] if c is not None]
-        price = r["meta"].get("regularMarketPrice") or closes[-1]
-        prev = closes[-2] if len(closes) >= 2 else r["meta"].get("chartPreviousClose")
-        return {"label": label, "kind": kind, "price": float(price), "prev": float(prev)}
+        offset = r["meta"].get("gmtoffset") or 0
+        days, closes = [], []
+        for ts, c in zip(r["timestamp"], r["indicators"]["quote"][0]["close"]):
+            if c is None:
+                continue
+            day = (ts + offset) // 86400  # the exchange's own calendar day
+            if days and days[-1] == day:  # Yahoo sometimes repeats today's live bar
+                closes[-1] = round(c, 4)
+            else:
+                days.append(day)
+                closes.append(round(c, 4))
+        if len(closes) < 2:
+            return None
+        return {"label": label, "kind": kind, "sym": sym, "id": re.sub(r"[^a-z0-9]+", "-", label.lower()).strip("-"),
+                "url": f"https://finance.yahoo.com/quote/{urllib.parse.quote(sym, safe='')}/",
+                "price": float(closes[-1]), "prev": float(closes[-2]), "t": days, "c": closes}
     except Exception:
         return None
 
@@ -807,8 +820,8 @@ def brief_html(c, today):
 def ticker_html(quotes):
     if not quotes:
         return ""
-    cells = ['<span class="tk tk-label">Last<br>close</span>']
-    for q in quotes:
+    cells = ['<span class="tk tk-label">Markets<small>Tap for charts</small></span>']
+    for i, q in enumerate(quotes):
         price, prev, kind = q["price"], q["prev"], q["kind"]
         if kind == "yield":
             val, chg = f"{price:.2f}%", f"{abs(price - prev) * 100:.0f} bp"
@@ -819,9 +832,34 @@ def ticker_html(quotes):
             chg = f"{pct:.2f}%"
         cls = "up" if price > prev else "down" if price < prev else "flat"
         arrow = "▲" if cls == "up" else "▼" if cls == "down" else "●"
-        cells.append(f'<span class="tk"><b>{esc(q["label"])}</b><span><span class="v">{val}</span>'
-                     f'<span class="{cls}">{arrow} {chg}</span></span></span>')
+        cells.append(f'<a class="tk" href="#{esc(q["id"])}" data-i="{i}" title="{esc(q["label"])}: one-year chart">'
+                     f'<b>{esc(q["label"])}</b><span><span class="v">{val}</span>'
+                     f'<span class="{cls}">{arrow} {chg}</span></span></a>')
     return f'<div class="ticker" aria-label="Markets at last close"><div class="ticker-in">{"".join(cells)}</div></div>'
+
+
+def market_panel_html(quotes):
+    """The chart panel the ticker opens; the page script fills it from the data below it."""
+    if not quotes:
+        return ""
+    data = json.dumps([{k: q[k] for k in ("label", "kind", "id", "url", "t", "c")} for q in quotes],
+                      separators=(",", ":")).replace("</", "<\\/")
+    return f"""<dialog id="mk" class="mk" aria-labelledby="mk-name">
+<div class="mk-in">
+  <div class="mk-head">
+    <div><p class="mk-kicker">Markets · daily closes</p><h2 id="mk-name" class="mk-name" tabindex="-1" autofocus></h2></div>
+    <div class="mk-nav"><button type="button" class="mk-btn" data-step="-1" aria-label="Previous market">‹</button><button type="button" class="mk-btn" data-step="1" aria-label="Next market">›</button><button type="button" class="mk-btn" id="mk-x" aria-label="Close">×</button></div>
+  </div>
+  <div class="mk-hero"><span id="mk-price" class="mk-price"></span><span id="mk-day" class="mk-day"></span></div>
+  <p id="mk-asof" class="mk-asof"></p>
+  <div class="mk-bar"><div class="mk-range" role="group" aria-label="Time range"><button type="button" data-r="21">1M</button><button type="button" data-r="63">3M</button><button type="button" data-r="126">6M</button><button type="button" data-r="400">1Y</button></div><span id="mk-ret" class="mk-ret"></span></div>
+  <div id="mk-chart" class="mk-chart" tabindex="0" role="img"></div>
+  <dl id="mk-stats" class="mk-stats"></dl>
+  <details class="mk-table"><summary>Show the numbers</summary><table><thead><tr><th>Date</th><th>Close</th><th>Change</th></tr></thead><tbody id="mk-rows"></tbody></table></details>
+  <p class="mk-foot">Closing prices from Yahoo Finance. <a id="mk-link" href="#" target="_blank" rel="noopener">More on Yahoo Finance ↗</a></p>
+</div>
+</dialog>
+<script id="mk-data" type="application/json">{data}</script>"""
 
 
 def desk_html(desk, today):
@@ -989,12 +1027,13 @@ def render(ctx, prefix, archived):
   <div class="foot-grid">
     <div><h3 class="small-h">About this paper</h3>
       <p>{PAPER} prints itself every morning at about 6 AM India time. A small program reads the public RSS feeds of 20 publishers, keeps what’s free to read, puts the same story from different papers together, and links every headline to the original article. Nothing here gets around a paywall: locked stories show only the headline and summary the publisher shares for free.</p>
-      <p>Headlines, summaries and pictures belong to their publishers. The paper covers the last 30 hours; pictures are shown in black and white (hover to see colour), and links you’ve opened turn grey.</p>
+      <p>Headlines, summaries and pictures belong to their publishers. The paper covers the last 30 hours, and links you’ve opened turn grey. Tap any market in the strip at the top for its one-year chart.</p>
       {fail_note}</div>
     <div><h3 class="small-h">Read this morning</h3><ul class="srcs">{src_list}</ul></div>
   </div>
   <p class="colophon">Printed {date_long}, {printed} IST · {ctx["clusters"]:,} distinct stories found · Made by <a href="https://github.com/{AUTHOR}">{AUTHOR}</a> · <a href="{REPO_URL}">How it works</a></p>
 </footer>
+{market_panel_html(ctx["quotes"])}
 <script>{JS}</script>
 </body>
 </html>
@@ -1096,14 +1135,14 @@ def main():
 # -------------------------------------------------------------------- CSS --
 CSS = r"""
 :root{--bg:#f5f0e5;--paper:#fbf8f1;--ink:#1b1a17;--ink2:#3a3731;--muted:#6d675c;--hair:#d8cfbc;--rule:#1b1a17;
---accent:#9c2b1f;--up:#1c6f45;--down:#ad2a1e;--lock:#86661a;--visited:#7a7468;
+--accent:#9c2b1f;--up:#1c6f45;--down:#ad2a1e;--lock:#86661a;--visited:#7a7468;--wash:rgba(27,26,23,.055);
 --serif:"Newsreader",Georgia,"Times New Roman",serif;--sans:"Libre Franklin","Segoe UI",system-ui,sans-serif;
 --black:"UnifrakturMaguntia","Old English Text MT",Georgia,serif;color-scheme:light}
 @media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#151412;--paper:#1d1c19;--ink:#ece7dc;
 --ink2:#cfc8ba;--muted:#9c9588;--hair:#36332d;--rule:#d9d3c6;--accent:#e58474;--up:#5fc28f;--down:#f08070;
---lock:#d6b15a;--visited:#8d877b;color-scheme:dark}}
+--lock:#d6b15a;--visited:#8d877b;--wash:rgba(236,231,220,.07);color-scheme:dark}}
 :root[data-theme="dark"]{--bg:#151412;--paper:#1d1c19;--ink:#ece7dc;--ink2:#cfc8ba;--muted:#9c9588;--hair:#36332d;
---rule:#d9d3c6;--accent:#e58474;--up:#5fc28f;--down:#f08070;--lock:#d6b15a;--visited:#8d877b;color-scheme:dark}
+--rule:#d9d3c6;--accent:#e58474;--up:#5fc28f;--down:#f08070;--lock:#d6b15a;--visited:#8d877b;--wash:rgba(236,231,220,.07);color-scheme:dark}
 *{box-sizing:border-box}
 html{scroll-padding-top:56px}
 body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--serif);font-size:17px;line-height:1.45;
@@ -1152,6 +1191,62 @@ color:var(--accent);flex:0 0 auto;line-height:1.25}
 .tk .v{font-weight:600;margin-right:6px}
 .tk .up,.tk .down,.tk .flat{font-size:12px}
 .up{color:var(--up)}.down{color:var(--down)}.flat{color:var(--muted)}
+a.tk{text-decoration:none;color:inherit;cursor:pointer;transition:background .15s}
+a.tk:hover,a.tk:focus-visible{background:var(--wash)}
+a.tk:hover b{color:var(--ink)}
+a.tk:focus-visible{outline-offset:-2px}
+.tk-label small{display:block;font-size:9px;letter-spacing:.07em;color:var(--muted);font-weight:600;margin-top:1px}
+
+/* market chart panel */
+.mk{border:0;padding:0;background:var(--paper);color:var(--ink);width:min(700px,calc(100vw - 24px));
+max-height:calc(100vh - 24px);border-radius:8px;box-shadow:0 24px 70px rgba(0,0,0,.35)}
+.mk::backdrop{background:rgba(18,16,13,.55)}
+.mk-in{padding:18px 22px 16px}
+@media(max-width:600px){.mk{width:100vw;max-width:100vw;margin:auto 0 0;border-radius:14px 14px 0 0;max-height:92vh}
+.mk-in{padding:16px 16px 20px}}
+.mk-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}
+.mk-kicker{font:700 10.5px/1.3 var(--sans);letter-spacing:.1em;text-transform:uppercase;color:var(--accent);margin:0 0 3px}
+.mk-name{font:700 28px/1.1 var(--serif);margin:0}
+.mk-name:focus{outline:none}
+.mk-nav{display:flex;gap:6px;flex:0 0 auto}
+.mk-btn{width:34px;height:34px;border:1px solid var(--hair);background:none;color:var(--ink);border-radius:50%;
+font:500 18px/1 var(--sans);cursor:pointer;display:grid;place-items:center;padding:0}
+.mk-btn:hover{background:var(--wash)}
+.mk-hero{display:flex;align-items:baseline;flex-wrap:wrap;gap:4px 12px;margin:12px 0 2px}
+.mk-price{font:600 46px/1 var(--sans);letter-spacing:-.015em}
+.mk-day{font:600 14px var(--sans)}
+.mk-asof{font:500 11px var(--sans);color:var(--muted);letter-spacing:.06em;text-transform:uppercase;margin:4px 0 12px}
+.mk-bar{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px 12px;margin:0 0 10px}
+.mk-range{display:inline-flex;border:1px solid var(--hair);border-radius:999px;padding:2px}
+.mk-range button{font:600 12px var(--sans);letter-spacing:.05em;border:0;background:none;color:var(--muted);
+padding:6px 13px;border-radius:999px;cursor:pointer}
+.mk-range button:hover{color:var(--ink)}
+.mk-range button[aria-pressed="true"]{background:var(--ink);color:var(--paper)}
+.mk-ret{font:600 13px var(--sans)}
+.mk-chart{position:relative;touch-action:pan-y}
+.mk-chart:focus{outline:none}
+.mk-chart:focus-visible{outline:2px solid var(--accent);outline-offset:4px;border-radius:2px}
+.mk-chart svg{display:block;width:100%;height:auto;overflow:visible}
+.mk-grid{stroke:var(--hair);stroke-width:1;shape-rendering:crispEdges}
+.mk-tick{font:500 10.5px var(--sans);fill:var(--muted);font-variant-numeric:tabular-nums}
+.mk-line{fill:none;stroke-width:2;stroke-linejoin:round;stroke-linecap:round}
+.mk-cross{stroke:var(--muted);stroke-width:1;shape-rendering:crispEdges}
+.mk-tip{position:absolute;top:2px;pointer-events:none;background:var(--ink);color:var(--paper);
+font:500 11px/1.35 var(--sans);padding:6px 9px;border-radius:4px;white-space:nowrap}
+.mk-tip b{display:block;font-size:14px;font-weight:700}
+.mk-stats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px 18px;margin:14px 0 10px;padding-top:12px;
+border-top:1px solid var(--hair)}
+@media(max-width:520px){.mk-stats{grid-template-columns:repeat(2,minmax(0,1fr))}}
+.mk-stats dt{font:600 10px/1.3 var(--sans);letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}
+.mk-stats dd{margin:3px 0 0;font:600 15px/1.25 var(--sans)}
+.mk-stats dd small{display:block;font-weight:500;color:var(--muted);font-size:11px}
+.mk-table summary{cursor:pointer;font:600 12px var(--sans);color:var(--ink2);padding:4px 0}
+.mk-table table{width:100%;border-collapse:collapse;font:500 12.5px var(--sans);font-variant-numeric:tabular-nums;margin-top:6px}
+.mk-table th{font-weight:600;color:var(--muted);font-size:10.5px;letter-spacing:.07em;text-transform:uppercase}
+.mk-table th,.mk-table td{text-align:right;padding:5px 6px;border-bottom:1px dotted var(--hair)}
+.mk-table th:first-child,.mk-table td:first-child{text-align:left}
+.mk-foot{font:500 11.5px/1.5 var(--sans);color:var(--muted);margin:10px 0 0}
+.mk-foot a{color:var(--ink)}
 
 /* section nav */
 .secnav{position:sticky;top:0;z-index:5;background:var(--bg);border-bottom:1px solid var(--rule)}
@@ -1193,8 +1288,9 @@ display:flex;flex-wrap:wrap;align-items:center;gap:2px 6px;margin:0}
 .more a:visited{color:var(--visited)}
 .ms{font:600 10px var(--sans);letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin-left:7px}
 .fig{display:block;margin:0 0 10px;overflow:hidden;background:var(--hair)}
-.fig img{display:block;width:100%;aspect-ratio:16/9;object-fit:cover;filter:grayscale(1) contrast(1.06);transition:filter .35s}
-.story:hover .fig img{filter:none}
+.fig img{display:block;width:100%;aspect-ratio:16/9;object-fit:cover;transition:transform .6s cubic-bezier(.2,.7,.2,1)}
+.story:hover .fig img{transform:scale(1.035)}
+@media (prefers-reduced-motion:reduce){.fig img{transition:none}.story:hover .fig img{transform:none}}
 
 /* front page */
 .front-top{display:grid;gap:22px;padding:22px 0;border-bottom:1px solid var(--rule)}
@@ -1301,9 +1397,192 @@ JS = r"""
   }
   q.addEventListener('input',run);
   document.addEventListener('keydown',function(e){
+    if(document.querySelector('dialog[open]')) return;
     if(e.key==='/'&&document.activeElement!==q){e.preventDefault();q.focus();}
     else if(e.key==='Escape'&&document.activeElement===q){q.value='';run();q.blur();}
   });
+})();
+
+/* Market chart panel: tap a market in the strip -> its daily closes, 1M to 1Y. */
+(function(){
+  var dlg=document.getElementById('mk'), src=document.getElementById('mk-data');
+  if(!dlg||!src) return;
+  var Q=JSON.parse(src.textContent), cur=0, range=126;
+  var reduce=window.matchMedia&&matchMedia('(prefers-reduced-motion: reduce)').matches;
+  var NS='http://www.w3.org/2000/svg', $=function(id){return document.getElementById(id)};
+  var SPAN={21:'1 month',63:'3 months',126:'6 months',400:'1 year'};
+
+  function num(v,d){return v.toLocaleString('en-US',{minimumFractionDigits:d,maximumFractionDigits:d})}
+  function fmt(v,k){
+    if(k==='yield') return num(v,2)+'%';
+    if(k==='fx') return '₹'+num(v,2);
+    if(k==='usd') return '$'+num(v,v<1000?2:0);
+    return num(v,2);
+  }
+  function tick(v,k,d){return k==='yield'?v.toFixed(d)+'%':k==='usd'?'$'+num(v,d):num(v,d)}
+  function move(a,b,k){
+    var up=a>b, dn=a<b, arrow=up?'▲ ':dn?'▼ ':'● ';
+    var t=k==='yield'?Math.abs(Math.round((a-b)*100))+' bp':Math.abs((a/b-1)*100).toFixed(2)+'%';
+    return {cls:up?'up':dn?'down':'flat', text:arrow+t};
+  }
+  var MON=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  function day(d,yr){var x=new Date(d*864e5); return x.getUTCDate()+' '+MON[x.getUTCMonth()]+(yr?' '+x.getUTCFullYear():'')}
+  function mon(d){return new Date(d*864e5).getUTCMonth()}
+  function svgEl(tag,attrs,parent){
+    var e=document.createElementNS(NS,tag);
+    for(var a in attrs) e.setAttribute(a,attrs[a]);
+    parent.appendChild(e); return e;
+  }
+  function stat(dl,label,value,note,cls){
+    var g=document.createElement('div'), dt=document.createElement('dt'), dd=document.createElement('dd'), v=document.createElement('span');
+    dt.textContent=label; v.textContent=value; if(cls) v.className=cls; dd.appendChild(v);
+    if(note){var s=document.createElement('small'); s.textContent=note; dd.appendChild(s);}
+    g.appendChild(dt); g.appendChild(dd); dl.appendChild(g);
+  }
+
+  function header(){
+    var q=Q[cur], n=q.c.length, last=q.c[n-1], prev=q.c[n-2];
+    $('mk-name').textContent=q.label;
+    $('mk-price').textContent=fmt(last,q.kind);
+    var d=move(last,prev,q.kind), de=$('mk-day');
+    de.textContent=d.text+' on the day'; de.className='mk-day '+d.cls;
+    $('mk-asof').textContent='As of '+day(q.t[n-1],true);
+    $('mk-link').href=q.url;
+    var hi=-Infinity, lo=Infinity, hiD=0, loD=0;
+    for(var i=0;i<n;i++){ if(q.c[i]>hi){hi=q.c[i];hiD=q.t[i]} if(q.c[i]<lo){lo=q.c[i];loD=q.t[i]} }
+    var dl=$('mk-stats'); dl.textContent='';
+    stat(dl,'Previous close',fmt(prev,q.kind),day(q.t[n-2],true));
+    stat(dl,'52-week high',fmt(hi,q.kind),day(hiD,true));
+    stat(dl,'52-week low',fmt(lo,q.kind),day(loD,true));
+    var m=move(last,q.c[Math.max(0,n-22)],q.kind); stat(dl,'1 month',m.text,null,m.cls);
+    var y=move(last,q.c[0],q.kind); stat(dl,n>=240?'1 year':'Since '+day(q.t[0],true),y.text,null,y.cls);
+    var off=q.kind==='yield'?Math.round((hi-last)*100)+' bp':((1-last/hi)*100).toFixed(1)+'%';
+    stat(dl,'From the high',last>=hi?'At the high':off+' below',null,null);
+  }
+
+  function rows(q,c,t,k){
+    var body=$('mk-rows'), pick=[], i;
+    body.textContent='';
+    if(k<=25){ for(i=k-1;i>=0;i--) pick.push(i); }
+    else {
+      var monthly=k>70, key=function(j){  /* last close of each month, or of each Monday-to-Friday week */
+        var d=new Date(t[j]*864e5); return monthly?d.getUTCFullYear()*12+d.getUTCMonth():Math.floor((t[j]-4)/7)};
+      for(i=k-1;i>=0;i--) if(i===k-1||key(i)!==key(i+1)) pick.push(i);
+    }
+    for(var j=0;j<pick.length;j++){
+      var a=pick[j], b=pick[j+1], tr=document.createElement('tr'), ch=b===undefined?null:move(c[a],c[b],q.kind);
+      [day(t[a],true),fmt(c[a],q.kind),ch?ch.text:'—'].forEach(function(v,x){
+        var td=document.createElement('td'); td.textContent=v; if(x===2&&ch) td.className=ch.cls; tr.appendChild(td);
+      });
+      body.appendChild(tr);
+    }
+  }
+
+  function draw(){
+    var q=Q[cur], n=q.c.length, k=Math.min(range,n), c=q.c.slice(n-k), t=q.t.slice(n-k);
+    var box=$('mk-chart'); box.textContent='';
+    var W=Math.max(280,box.clientWidth), H=Math.round(Math.min(260,Math.max(190,W*.42)));
+    var L=56, R=10, T=12, B=26, pw=W-L-R, ph=H-T-B;
+    var lo=Math.min.apply(null,c), hi=Math.max.apply(null,c), pad=(hi-lo)*.08||Math.abs(hi)*.01||1;
+    lo-=pad; hi+=pad;
+    var raw=(hi-lo)/4, p=Math.pow(10,Math.floor(Math.log10(raw))), mm=raw/p;
+    var step=p*(mm>=7.5?10:mm>=3.5?5:mm>=1.5?2:1), dec=Math.max(0,Math.min(2,-Math.floor(Math.log10(step))));
+    var X=function(i){return L+(k<2?pw/2:i*pw/(k-1))}, Y=function(v){return T+(hi-v)/(hi-lo)*ph};
+    var svg=svgEl('svg',{viewBox:'0 0 '+W+' '+H,width:W,height:H},box);
+    for(var v=Math.ceil(lo/step)*step; v<=hi+1e-9; v+=step){
+      var gy=Math.round(Y(v))+.5;
+      svgEl('line',{x1:L,x2:W-R,y1:gy,y2:gy,'class':'mk-grid'},svg);
+      svgEl('text',{x:L-8,y:gy+3.5,'text-anchor':'end','class':'mk-tick'},svg).textContent=tick(v,q.kind,dec);
+    }
+    var lastX=-1e9;
+    for(var i=0;i<k;i++){
+      var lab=null;
+      if(k<=25){ if((k-1-i)%5===0) lab=day(t[i]); }
+      else if(i>0&&mon(t[i])!==mon(t[i-1])){
+        var dt=new Date(t[i]*864e5);
+        lab=MON[dt.getUTCMonth()]+(dt.getUTCMonth()===0?' ’'+String(dt.getUTCFullYear()).slice(2):'');
+      }
+      var x=X(i);
+      if(lab&&x-lastX>=44&&x>L+12&&x<W-R-12){
+        svgEl('text',{x:x,y:H-7,'text-anchor':'middle','class':'mk-tick'},svg).textContent=lab; lastX=x;
+      }
+    }
+    var up=c[k-1]>=c[0], col=up?'var(--up)':'var(--down)', d='';
+    for(i=0;i<k;i++) d+=(i?'L':'M')+X(i).toFixed(1)+' '+Y(c[i]).toFixed(1);
+    svgEl('path',{d:d+'L'+X(k-1).toFixed(1)+' '+(T+ph)+'L'+X(0).toFixed(1)+' '+(T+ph)+'Z',style:'fill:'+col+';fill-opacity:.1'},svg);
+    var line=svgEl('path',{d:d,'class':'mk-line',style:'stroke:'+col},svg);
+    svgEl('circle',{cx:X(k-1),cy:Y(c[k-1]),r:4.5,style:'fill:'+col+';stroke:var(--paper);stroke-width:2'},svg);
+    if(!reduce&&line.getTotalLength){
+      var len=line.getTotalLength();
+      line.style.strokeDasharray=len; line.style.strokeDashoffset=len;
+      line.getBoundingClientRect();
+      line.style.transition='stroke-dashoffset .7s ease-out'; line.style.strokeDashoffset=0;
+      /* if the browser skips the transition (background tab, power saving), still show the line */
+      setTimeout(function(){line.style.transition='none'; line.style.strokeDasharray='none'},800);
+    }
+    var cross=svgEl('line',{y1:T,y2:T+ph,'class':'mk-cross',visibility:'hidden'},svg);
+    var dot=svgEl('circle',{r:4.5,visibility:'hidden',style:'fill:'+col+';stroke:var(--paper);stroke-width:2'},svg);
+    var hit=svgEl('rect',{x:L-6,y:0,width:pw+12,height:H,fill:'transparent'},svg);
+    var tip=document.createElement('div'), tb=document.createElement('b'), ts=document.createElement('span');
+    tip.className='mk-tip'; tip.hidden=true; tip.appendChild(tb); tip.appendChild(ts); box.appendChild(tip);
+    var idx=k-1;
+    function show(j){
+      idx=Math.max(0,Math.min(k-1,j)); var x=X(idx), y=Y(c[idx]);
+      cross.setAttribute('x1',x); cross.setAttribute('x2',x); cross.setAttribute('visibility','visible');
+      dot.setAttribute('cx',x); dot.setAttribute('cy',y); dot.setAttribute('visibility','visible');
+      tb.textContent=fmt(c[idx],q.kind); ts.textContent=day(t[idx],true); tip.hidden=false;
+      var sx=x*box.clientWidth/W, tw=tip.offsetWidth;
+      tip.style.left=Math.max(0,Math.min(box.clientWidth-tw,sx-tw/2))+'px';
+    }
+    function hide(){cross.setAttribute('visibility','hidden'); dot.setAttribute('visibility','hidden'); tip.hidden=true}
+    function at(e){var r=svg.getBoundingClientRect(); return Math.round(((e.clientX-r.left)*W/r.width-L)/(pw/Math.max(1,k-1)))}
+    hit.addEventListener('pointermove',function(e){show(at(e))});
+    hit.addEventListener('pointerdown',function(e){show(at(e))});
+    hit.addEventListener('pointerleave',hide);
+    box.onkeydown=function(e){
+      if(e.key==='ArrowLeft'||e.key==='ArrowRight'){e.preventDefault(); e.stopPropagation(); show((tip.hidden?k-1:idx)+(e.key==='ArrowLeft'?-1:1))}
+      else if(e.key==='Home'){e.preventDefault(); show(0)} else if(e.key==='End'){e.preventDefault(); show(k-1)}
+    };
+    box.onblur=hide;
+    var span=range===400?(n>=240?'1 year':'since '+day(t[0],true)):SPAN[range];
+    box.setAttribute('aria-label',q.label+' closing prices over '+span+': '+fmt(c[0],q.kind)+' to '+fmt(c[k-1],q.kind));
+    var r=move(c[k-1],c[0],q.kind), re=$('mk-ret');
+    re.textContent=r.text+(range===400&&n<240?' ':' over ')+span; re.className='mk-ret '+r.cls;
+    rows(q,c,t,k);
+  }
+
+  var btns=dlg.querySelectorAll('.mk-range button');
+  function setRange(r){
+    range=r;
+    for(var i=0;i<btns.length;i++) btns[i].setAttribute('aria-pressed',String(+btns[i].getAttribute('data-r')===r));
+    draw();
+  }
+  for(var b=0;b<btns.length;b++) btns[b].addEventListener('click',function(){setRange(+this.getAttribute('data-r'))});
+
+  function open(i){
+    cur=(i+Q.length)%Q.length; header();
+    if(!dlg.open) dlg.showModal();
+    setRange(range);
+    try{history.replaceState(null,'','#'+Q[cur].id)}catch(e){}
+  }
+  document.querySelectorAll('a.tk[data-i]').forEach(function(a){
+    a.addEventListener('click',function(e){
+      e.preventDefault(); var i=+a.getAttribute('data-i');
+      if(dlg.showModal) open(i); else window.open(Q[i].url,'_blank','noopener');
+    });
+  });
+  dlg.querySelectorAll('[data-step]').forEach(function(s){
+    s.addEventListener('click',function(){open(cur+(+s.getAttribute('data-step')))});
+  });
+  $('mk-x').addEventListener('click',function(){dlg.close()});
+  dlg.addEventListener('click',function(e){if(e.target===dlg) dlg.close()});
+  dlg.addEventListener('close',function(){try{history.replaceState(null,'',location.href.split('#')[0])}catch(e){}});
+  dlg.addEventListener('keydown',function(e){
+    if((e.key==='ArrowLeft'||e.key==='ArrowRight')&&e.target.id!=='mk-chart') open(cur+(e.key==='ArrowLeft'?-1:1));
+  });
+  window.addEventListener('resize',function(){if(dlg.open) draw()});
+  var h=location.hash.slice(1);
+  for(var i=0;i<Q.length;i++) if(Q[i].id===h&&dlg.showModal){open(i); break}
 })();
 """
 
