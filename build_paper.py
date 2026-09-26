@@ -150,9 +150,8 @@ TICKERS = [  # label, Yahoo symbol, kind
 ]
 
 # Your watchlist: label, Yahoo symbol (".NS" = NSE), price kind ("inr" or "usd2"), words that
-# mark a headline as being about it. The five banks from the IB project, and Nestlé India.
+# mark a headline as being about it. The five banks from the IB project.
 WATCHLIST = [
-    ("Nestlé India", "NESTLEIND.NS", "inr", [r"nestl[eé]"]),
     ("JPMorgan", "JPM", "usd2", [r"jp ?morgan", r"jamie dimon"]),
     ("Goldman Sachs", "GS", "usd2", [r"goldman"]),
     ("Morgan Stanley", "MS", "usd2", [r"morgan stanley"]),
