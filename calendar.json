@@ -1,0 +1,31 @@
+{
+  "about": "Fixed-date events for The Week Ahead. India CPI (12th), WPI (14th) and GDP (last weekday of Feb/May/Aug/Nov) are worked out by build_paper.py, so they are not listed here. Refresh each December from the official pages: RBI MPC calendar (rbi.org.in press release), FOMC (federalreserve.gov/monetarypolicy/fomccalendars.htm), BLS CPI and Employment Situation schedules (bls.gov/schedule), NSE trading holidays (NSE circular).",
+  "checked": "2026-09-26",
+  "events": [
+    {"date": "2026-10-02", "tag": "US", "kind": "data", "title": "US jobs report", "detail": "September payrolls · 6:00 PM IST"},
+    {"date": "2026-10-02", "tag": "IN", "kind": "holiday", "title": "Markets closed", "detail": "NSE & BSE shut for Gandhi Jayanti"},
+    {"date": "2026-10-07", "tag": "IN", "kind": "policy", "title": "RBI policy decision", "detail": "Rate call after the 5–7 Oct MPC meeting · 10 AM IST"},
+    {"date": "2026-10-14", "tag": "US", "kind": "data", "title": "US inflation (CPI)", "detail": "September figures · 6:00 PM IST"},
+    {"date": "2026-10-20", "tag": "IN", "kind": "holiday", "title": "Markets closed", "detail": "NSE & BSE shut for Dussehra"},
+    {"date": "2026-10-28", "tag": "US", "kind": "policy", "title": "Fed rate decision", "detail": "FOMC 27–28 Oct · 11:30 PM IST"},
+    {"date": "2026-11-06", "tag": "US", "kind": "data", "title": "US jobs report", "detail": "October payrolls · 7:00 PM IST"},
+    {"date": "2026-11-08", "tag": "IN", "kind": "holiday", "title": "Muhurat trading", "detail": "One-hour Diwali session on a Sunday; timing set by NSE"},
+    {"date": "2026-11-10", "tag": "IN", "kind": "holiday", "title": "Markets closed", "detail": "NSE & BSE shut for Diwali Balipratipada"},
+    {"date": "2026-11-10", "tag": "US", "kind": "data", "title": "US inflation (CPI)", "detail": "October figures · 7:00 PM IST"},
+    {"date": "2026-11-24", "tag": "IN", "kind": "holiday", "title": "Markets closed", "detail": "NSE & BSE shut for Guru Nanak Jayanti"},
+    {"date": "2026-12-04", "tag": "IN", "kind": "policy", "title": "RBI policy decision", "detail": "Rate call after the 2–4 Dec MPC meeting · 10 AM IST"},
+    {"date": "2026-12-04", "tag": "US", "kind": "data", "title": "US jobs report", "detail": "November payrolls · 7:00 PM IST"},
+    {"date": "2026-12-09", "tag": "US", "kind": "policy", "title": "Fed rate decision + projections", "detail": "FOMC 8–9 Dec · 12:30 AM IST (Thu 10 Dec)"},
+    {"date": "2026-12-10", "tag": "US", "kind": "data", "title": "US inflation (CPI)", "detail": "November figures · 7:00 PM IST"},
+    {"date": "2026-12-25", "tag": "IN", "kind": "holiday", "title": "Markets closed", "detail": "NSE & BSE shut for Christmas"},
+    {"date": "2027-01-27", "tag": "US", "kind": "policy", "title": "Fed rate decision", "detail": "FOMC 26–27 Jan · 12:30 AM IST (Thu 28 Jan)"},
+    {"date": "2027-02-05", "tag": "IN", "kind": "policy", "title": "RBI policy decision", "detail": "Rate call after the 3–5 Feb MPC meeting · 10 AM IST"},
+    {"date": "2027-03-17", "tag": "US", "kind": "policy", "title": "Fed rate decision + projections", "detail": "FOMC 16–17 Mar · 11:30 PM IST"},
+    {"date": "2027-04-28", "tag": "US", "kind": "policy", "title": "Fed rate decision", "detail": "FOMC 27–28 Apr · 11:30 PM IST"},
+    {"date": "2027-06-09", "tag": "US", "kind": "policy", "title": "Fed rate decision + projections", "detail": "FOMC 8–9 Jun · 11:30 PM IST"},
+    {"date": "2027-07-28", "tag": "US", "kind": "policy", "title": "Fed rate decision", "detail": "FOMC 27–28 Jul · 11:30 PM IST"},
+    {"date": "2027-09-15", "tag": "US", "kind": "policy", "title": "Fed rate decision + projections", "detail": "FOMC 14–15 Sep · 11:30 PM IST"},
+    {"date": "2027-10-27", "tag": "US", "kind": "policy", "title": "Fed rate decision", "detail": "FOMC 26–27 Oct · 11:30 PM IST"},
+    {"date": "2027-12-08", "tag": "US", "kind": "policy", "title": "Fed rate decision + projections", "detail": "FOMC 7–8 Dec · 12:30 AM IST (Thu 9 Dec)"}
+  ]
+}

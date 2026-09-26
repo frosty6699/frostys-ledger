@@ -13,15 +13,18 @@ publishes the result to GitHub Pages. It is safe to run by hand:
 
 Standard library only - nothing to install.
 """
+import csv
 import gzip
 import html
 import html.entities
+import io
 import json
 import math
 import os
 import re
 import sys
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -32,6 +35,8 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
+
+import cfa_lens
 
 ROOT = Path(__file__).resolve().parent
 EDITIONS = ROOT / "editions"
@@ -142,6 +147,17 @@ TICKERS = [  # label, Yahoo symbol, kind
     ("Nifty 50", "^NSEI", "index"), ("Sensex", "^BSESN", "index"), ("Bank Nifty", "^NSEBANK", "index"),
     ("USD/INR", "INR=X", "fx"), ("Brent", "BZ=F", "usd"), ("Gold", "GC=F", "usd"),
     ("S&P 500", "^GSPC", "index"), ("US 10Y", "^TNX", "yield"),
+]
+
+# Your watchlist: label, Yahoo symbol (".NS" = NSE), price kind ("inr" or "usd2"), words that
+# mark a headline as being about it. The five banks from the IB project, and Nestlé India.
+WATCHLIST = [
+    ("Nestlé India", "NESTLEIND.NS", "inr", [r"nestl[eé]"]),
+    ("JPMorgan", "JPM", "usd2", [r"jp ?morgan", r"jamie dimon"]),
+    ("Goldman Sachs", "GS", "usd2", [r"goldman"]),
+    ("Morgan Stanley", "MS", "usd2", [r"morgan stanley"]),
+    ("Bank of America", "BAC", "usd2", [r"bank of america", r"\bbofa\b"]),
+    ("Citigroup", "C", "usd2", [r"\bciti(group|bank)?\b"]),
 ]
 
 SECTIONS = [  # id, title, story cards, one-line briefs
@@ -417,31 +433,122 @@ def load_source(src):
     return src["key"], entries, errors
 
 
+def slug(text):
+    return re.sub(r"[^a-z0-9]+", "-", unicodedata.normalize("NFKD", text).encode("ascii", "ignore")
+                  .decode().lower()).strip("-")
+
+
+def series_from(result):
+    """Daily closes from a Yahoo chart result -> (days since 1970, closes), one per exchange day."""
+    offset = result["meta"].get("gmtoffset") or 0
+    days, closes = [], []
+    for ts, c in zip(result.get("timestamp") or [], result["indicators"]["quote"][0]["close"]):
+        if c is None:
+            continue
+        day = (ts + offset) // 86400  # the exchange's own calendar day
+        if days and days[-1] == day:  # Yahoo sometimes repeats today's live bar
+            closes[-1] = round(c, 4)
+        else:
+            days.append(day)
+            closes.append(round(c, 4))
+    return days, closes
+
+
+def quote_record(label, kind, sym, days, closes):
+    return {"label": label, "kind": kind, "sym": sym, "id": slug(label),
+            "url": f"https://finance.yahoo.com/quote/{urllib.parse.quote(sym, safe='')}/",
+            "price": float(closes[-1]), "prev": float(closes[-2]), "t": days, "c": closes}
+
+
 def fetch_quote(ticker):
     """A year of daily closes: the strip shows the last one, the chart panel all of them."""
-    label, sym, kind = ticker
+    label, sym, kind = ticker[:3]
     try:
         url = ("https://query1.finance.yahoo.com/v8/finance/chart/"
                f"{urllib.parse.quote(sym)}?range=1y&interval=1d")
-        r = json.loads(fetch(url, timeout=12))["chart"]["result"][0]
-        offset = r["meta"].get("gmtoffset") or 0
-        days, closes = [], []
-        for ts, c in zip(r["timestamp"], r["indicators"]["quote"][0]["close"]):
-            if c is None:
-                continue
-            day = (ts + offset) // 86400  # the exchange's own calendar day
-            if days and days[-1] == day:  # Yahoo sometimes repeats today's live bar
-                closes[-1] = round(c, 4)
-            else:
-                days.append(day)
-                closes.append(round(c, 4))
+        days, closes = series_from(json.loads(fetch(url, timeout=12))["chart"]["result"][0])
         if len(closes) < 2:
             return None
-        return {"label": label, "kind": kind, "sym": sym, "id": re.sub(r"[^a-z0-9]+", "-", label.lower()).strip("-"),
-                "url": f"https://finance.yahoo.com/quote/{urllib.parse.quote(sym, safe='')}/",
-                "price": float(closes[-1]), "prev": float(closes[-2]), "t": days, "c": closes}
+        rec = quote_record(label, kind, sym, days, closes)
+        if len(ticker) > 3:
+            rec["aliases"] = ticker[3]
+        return rec
     except Exception:
         return None
+
+
+NIFTY_LISTS = ["https://nsearchives.nseindia.com/content/indices/ind_nifty50list.csv",
+               "https://www.niftyindices.com/IndexConstituent/ind_nifty50list.csv",
+               "https://archives.nseindia.com/content/indices/ind_nifty50list.csv"]
+
+
+# What people actually call the long ones.
+SHORT_NAMES = {
+    "Adani Ports and Special Economic Zone": "Adani Ports", "Apollo Hospitals Enterprise": "Apollo Hospitals",
+    "Bharat Electronics": "BEL", "Dr. Reddy's Laboratories": "Dr Reddy's", "HCL Technologies": "HCLTech",
+    "HDFC Life Insurance Company": "HDFC Life", "Hindustan Unilever": "HUL", "InterGlobe Aviation": "IndiGo",
+    "Jio Financial Services": "Jio Financial", "Kotak Mahindra Bank": "Kotak Bank", "Larsen & Toubro": "L&T",
+    "Mahindra & Mahindra": "M&M", "Maruti Suzuki India": "Maruti Suzuki", "Max Healthcare Institute": "Max Healthcare",
+    "Nestle India": "Nestlé India", "Oil & Natural Gas Corporation": "ONGC",
+    "Power Grid Corporation of India": "Power Grid", "Reliance Industries": "Reliance",
+    "SBI Life Insurance Company": "SBI Life", "State Bank of India": "SBI", "Sun Pharmaceutical Industries": "Sun Pharma",
+    "Tata Consultancy Services": "TCS", "Tata Consumer Products": "Tata Consumer",
+    "Tata Motors Passenger Vehicles": "Tata Motors PV", "Titan Company": "Titan",
+}
+
+
+def short_name(name):
+    name = re.sub(r"\s+(Ltd\.?|Limited)$", "", name.strip(), flags=re.I)
+    return SHORT_NAMES.get(name) or re.sub(r"\s+(Corporation( of India)?|Company|Institute|Industries)$", "", name)
+
+
+def nifty50():
+    """Official Nifty 50 members {NSE symbol: name}; falls back to the last list that downloaded."""
+    path = CACHE / "nifty50.json"
+    for url in NIFTY_LISTS:
+        try:
+            rows = csv.DictReader(io.StringIO(fetch(url, timeout=15, tries=2).decode("utf-8-sig")))
+            names = {r["Symbol"].strip(): short_name(r["Company Name"])
+                     for r in rows if (r.get("Symbol") or "").strip()}
+            if len(names) >= 45:
+                CACHE.mkdir(exist_ok=True)
+                path.write_text(json.dumps(names, indent=1, ensure_ascii=False), encoding="utf-8")
+                return names
+        except Exception:
+            continue
+    try:
+        return {s: short_name(n) for s, n in json.loads(path.read_text(encoding="utf-8")).items()}
+    except Exception:
+        return {}
+
+
+def fetch_movers():
+    """The Nifty 50's biggest gainers and losers in the latest session."""
+    names = nifty50()
+    if not names:
+        return None
+    syms, rows = sorted(names), []
+    for i in range(0, len(syms), 10):
+        url = ("https://query1.finance.yahoo.com/v7/finance/spark?symbols="
+               + ",".join(urllib.parse.quote(s + ".NS") for s in syms[i:i + 10]) + "&range=1y&interval=1d")
+        try:
+            results = (json.loads(fetch(url, timeout=15)).get("spark") or {}).get("result") or []
+        except Exception:
+            continue
+        for r in results:
+            try:
+                days, closes = series_from(r["response"][0])
+            except Exception:
+                continue
+            base = r.get("symbol", "").removesuffix(".NS")
+            if len(closes) >= 2 and base in names:
+                rows.append(quote_record(names[base], "inr", r["symbol"], days, closes))
+    if len(rows) < 20:
+        return None
+    last = max(q["t"][-1] for q in rows)
+    rows = [q for q in rows if q["t"][-1] == last]  # only stocks that traded in the latest session
+    rows.sort(key=lambda q: q["price"] / q["prev"], reverse=True)
+    return {"day": last, "count": len(rows), "gainers": rows[:5], "losers": rows[::-1][:5]}
 
 
 # --------------------------------------------------------------- paywalls --
@@ -485,8 +592,11 @@ def check_paywalls(items):
 # ------------------------------------------------------------- the paper --
 def collect(now):
     with ThreadPoolExecutor(20) as ex:
+        movers_job = ex.submit(fetch_movers)
         feeds = list(ex.map(load_source, SOURCES))
         quotes = [q for q in ex.map(fetch_quote, TICKERS) if q]
+        watch = [q for q in ex.map(fetch_quote, WATCHLIST) if q]
+        movers = movers_job.result()
     status, items, desk, seen = {}, [], defaultdict(list), set()
     window = now - timedelta(hours=30)
     raw_count = 0
@@ -537,7 +647,7 @@ def collect(now):
             status[key]["n"] += 1
     for key in desk:
         desk[key].sort(key=lambda d: d["date"], reverse=True)
-    return items, desk, quotes, status, raw_count
+    return items, desk, quotes, status, raw_count, {"watch": watch, "movers": movers}
 
 
 def similar(a, b):
@@ -862,6 +972,191 @@ def market_panel_html(quotes):
 <script id="mk-data" type="application/json">{data}</script>"""
 
 
+# --------------------------------------------- watchlist, movers, week ahead --
+KIND_ORDER = {"holiday": 0, "policy": 1, "data": 2}
+
+
+def india_releases(start, end):
+    """India's regular data days: CPI on the 12th and WPI on the 14th (next Monday if that falls on a
+    weekend); GDP on the last weekday of February, May, August and November."""
+    def weekday_from(d):
+        while d.weekday() >= 5:
+            d += timedelta(days=1)
+        return d
+    out, y, m = [], start.year, start.month
+    while (y, m) <= (end.year, end.month):
+        prev = datetime(y - (m == 1), (m - 2) % 12 + 1, 1)
+        out.append({"date": weekday_from(datetime(y, m, 12).date()), "tag": "IN", "kind": "data",
+                    "title": "India inflation (CPI)", "detail": f"{prev:%B} figures · 4 PM IST"})
+        out.append({"date": weekday_from(datetime(y, m, 14).date()), "tag": "IN", "kind": "data",
+                    "title": "India wholesale prices (WPI)", "detail": f"{prev:%B} figures · 12 noon IST"})
+        if m in (2, 5, 8, 11):
+            last = datetime(y, m + 1, 1).date() - timedelta(days=1)
+            while last.weekday() >= 5:
+                last -= timedelta(days=1)
+            quarter = {2: "Oct–Dec", 5: "Jan–Mar", 8: "Apr–Jun", 11: "Jul–Sep"}[m]
+            out.append({"date": last, "tag": "IN", "kind": "data", "title": "India GDP",
+                        "detail": f"{quarter} quarter growth · 4 PM IST"})
+        y, m = (y + 1, 1) if m == 12 else (y, m + 1)
+    return out
+
+
+def week_ahead(today, horizon=7, at_least=3, most=8):
+    """The next week's market-moving dates; if it's a quiet week, the next few whenever they are."""
+    try:
+        fixed = json.loads((ROOT / "calendar.json").read_text(encoding="utf-8"))["events"]
+    except Exception:
+        fixed = []
+    events = [dict(e, date=datetime.strptime(e["date"], "%Y-%m-%d").date()) for e in fixed]
+    events += india_releases(today, today + timedelta(days=62))
+    upcoming = sorted((e for e in events if e["date"] >= today),
+                      key=lambda e: (e["date"], KIND_ORDER.get(e["kind"], 3), e["tag"] != "IN"))
+    soon = [e for e in upcoming if e["date"] < today + timedelta(days=horizon)]
+    return (soon if len(soon) >= at_least else upcoming[:at_least])[:most]
+
+
+def watch_news(watch, ranked):
+    """For each watchlist company: the best-ranked story that mentions it, and how many do."""
+    for q in watch:
+        rx = re.compile("|".join(q.get("aliases") or [re.escape(q["label"])]), re.I)
+        hits = [c for c in ranked if rx.search(c["primary"]["title"] + " " + c["primary"]["desc"])]
+        q["news"], q["mentions"] = (hits[0]["primary"] if hits else None), len(hits)
+
+
+def price_text(v, kind):
+    if kind == "yield":
+        return f"{v:.2f}%"
+    if kind == "fx":
+        return f"₹{v:.2f}"
+    if kind == "inr":
+        return f"₹{v:,.2f}"
+    if kind == "usd2" or (kind == "usd" and v < 1000):
+        return f"${v:,.2f}"
+    return f"${v:,.0f}" if kind == "usd" else f"{v:,.2f}"
+
+
+def move_html(price, prev, kind):
+    cls = "up" if price > prev else "down" if price < prev else "flat"
+    arrow = "▲" if cls == "up" else "▼" if cls == "down" else "●"
+    chg = f"{abs(price - prev) * 100:.0f} bp" if kind == "yield" else f"{abs(price / prev - 1) * 100:.2f}%"
+    return f'<span class="{cls}">{arrow} {chg}</span>'
+
+
+def dash_html(ctx):
+    """The band under the front page: your watchlist, the Nifty's movers, the week ahead."""
+    today, at = ctx["today"], ctx["panel_index"]
+    cols = []
+    if ctx["watch"]:
+        rows = []
+        for q in ctx["watch"]:
+            news = q.get("news")
+            line = ""
+            if news:
+                more = f'<span class="ms">+{q["mentions"] - 1} more</span>' if q["mentions"] > 1 else ""
+                line = (f'<p class="wl-line"><a href="{esc(news["link"])}" target="_blank" rel="noopener">'
+                        f'{esc(news["title"])}</a><span class="ms">{esc(SRC[news["src"]]["short"])}</span>{more}</p>')
+            rows.append(f'<li data-s="{esc((q["label"] + " " + (news["title"] if news else "")).lower())}">'
+                        f'<a class="wl-row" href="#{esc(q["id"])}" data-i="{at[q["sym"]]}">'
+                        f'<span class="wl-name">{esc(q["label"])}</span>'
+                        f'<span class="wl-px">{price_text(q["price"], q["kind"])}</span>'
+                        f'{move_html(q["price"], q["prev"], q["kind"])}</a>{line}</li>')
+        quiet = ("" if any(q.get("news") for q in ctx["watch"])
+                 else '<p class="wl-quiet">None of these are in today’s headlines.</p>')
+        cols.append(f'<div class="dash-col" id="watch" data-sec><header class="sec-head"><h2>Your Watchlist</h2>'
+                    f'<span class="sec-note">Tap for charts</span></header><ul class="wl">{"".join(rows)}</ul>'
+                    f'{quiet}</div>')
+    movers = ctx["movers"]
+    if movers:
+        session = (datetime(1970, 1, 1) + timedelta(days=movers["day"])).date()
+        label = "Today’s session" if session == today else f"{session:%a} {session.day} {session:%b} session"
+
+        def board(qs):
+            return "".join(
+                f'<li data-s="{esc(q["label"].lower())} nifty movers"><a class="mv-row" href="#{esc(q["id"])}" '
+                f'data-i="{at[q["sym"]]}" title="{esc(q["label"])} · {price_text(q["price"], q["kind"])}">'
+                f'<span class="mv-name">{esc(q["label"])}</span>{move_html(q["price"], q["prev"], q["kind"])}</a></li>'
+                for q in qs)
+        cols.append(f'<div class="dash-col" id="movers" data-sec><header class="sec-head"><h2>Nifty Movers</h2>'
+                    f'<span class="sec-note">{label}</span></header><div class="mv">'
+                    f'<div><h3 class="small-h">Top gainers</h3><ol class="mv-list">{board(movers["gainers"])}</ol></div>'
+                    f'<div><h3 class="small-h">Top losers</h3><ol class="mv-list">{board(movers["losers"])}</ol></div>'
+                    f'</div></div>')
+    if ctx["week"]:
+        rows = []
+        for e in ctx["week"]:
+            d = e["date"]
+            when = "Today" if d == today else "Tmrw" if d == today + timedelta(days=1) else f"{d:%a}"
+            rows.append(f'<li class="cal-{esc(e["kind"])}" data-s="{esc((e["title"] + " " + e["detail"]).lower())}">'
+                        f'<span class="cal-d"><b>{when}</b><span>{d.day}</span><small>{d:%b}</small></span>'
+                        f'<span class="cal-t"><b>{esc(e["title"])}</b><small>{esc(e["detail"])}</small></span>'
+                        f'<span class="cal-tag">{esc(e["tag"])}</span></li>')
+        cols.append(f'<div class="dash-col" id="week" data-sec><header class="sec-head"><h2>The Week Ahead</h2>'
+                    f'<span class="sec-note">Times in IST</span></header><ol class="cal">{"".join(rows)}</ol></div>')
+    return f'<section class="dash">{"".join(cols)}</section>' if cols else ""
+
+
+def lens_html(picks):
+    """The CFA Lens: today's stories next to the Level I concept each one illustrates."""
+    if not picks:
+        return ""
+    cards = []
+    for c, story in picks:
+        p = story["primary"]
+        cards.append(
+            f'<article class="lens-card" data-s="{esc((c["title"] + " " + c["topic"] + " " + p["title"] + " cfa").lower())}">'
+            f'<p class="kicker">{esc(c["topic"])}</p><h3 class="lens-h">{esc(c["title"])}</h3>'
+            f'<p class="lens-news"><span>In the news</span><a href="{esc(p["link"])}" target="_blank" rel="noopener">'
+            f'{esc(p["title"])}</a></p><p class="lens-x">{esc(c["explain"])}</p>'
+            f'<p class="lens-angle"><b>Exam angle</b>{esc(c["angle"])}</p></article>')
+    return (f'<section class="lens" id="lens" data-sec><header class="sec-head"><h2>The CFA Lens</h2>'
+            f'<span class="sec-note">Today’s news, exam-style · CFA Level I</span></header>'
+            f'<div class="lens-grid">{"".join(cards)}</div></section>')
+
+
+# The service worker behind offline mode: pages come from the network when there is one (and are
+# saved as they load); without a connection, the last saved copy opens instead.
+SERVICE_WORKER = r"""const V = '__VERSION__';
+const PAGES = 'ledger-pages', ASSETS = 'ledger-assets-' + V, IMGS = 'ledger-img', FONTS = 'ledger-fonts';
+self.addEventListener('install', e => {
+  self.skipWaiting();
+  e.waitUntil(caches.open(PAGES).then(c => c.addAll(['./', 'archive.html'])).catch(() => {}));
+});
+self.addEventListener('activate', e => {
+  e.waitUntil(caches.keys()
+    .then(keys => Promise.all(keys.filter(k => k.startsWith('ledger-assets-') && k !== ASSETS).map(k => caches.delete(k))))
+    .then(() => self.clients.claim()));
+});
+function trim(cache, max) {
+  cache.keys().then(keys => { if (keys.length > max) cache.delete(keys[0]).then(() => trim(cache, max)); });
+}
+self.addEventListener('fetch', e => {
+  const req = e.request;
+  if (req.method !== 'GET') return;
+  const url = new URL(req.url);
+  if (req.mode === 'navigate') {
+    e.respondWith(fetch(req)
+      .then(res => { const copy = res.clone(); caches.open(PAGES).then(c => c.put(req, copy)); return res; })
+      .catch(() => caches.match(req, {ignoreSearch: true}).then(r => r || caches.match('./'))));
+  } else if (url.origin === location.origin) {
+    e.respondWith(caches.open(ASSETS).then(c => c.match(req).then(r => r || fetch(req).then(res => {
+      if (res.ok) c.put(req, res.clone());
+      return res;
+    }))));
+  } else if (/fonts\.(googleapis|gstatic)\.com$/.test(url.hostname)) {
+    e.respondWith(caches.open(FONTS).then(c => c.match(req).then(r => {
+      const net = fetch(req).then(res => { c.put(req, res.clone()); return res; }).catch(() => r);
+      return r || net;
+    })));
+  } else if (req.destination === 'image') {
+    e.respondWith(caches.open(IMGS).then(c => c.match(req).then(r => r || fetch(req).then(res => {
+      c.put(req, res.clone()).then(() => trim(c, 40)).catch(() => {});
+      return res;
+    }).catch(() => r || Response.error()))));
+  }
+});
+"""
+
+
 def desk_html(desk, today):
     blocks = []
     for key, n in (("RBI", 6), ("Fed", 4)):
@@ -952,7 +1247,11 @@ def head_html(title, path, prefix, description=DESCRIPTION):
 def render(ctx, prefix, archived):
     today, now = ctx["today"], ctx["now"]
     front, sections = ctx["front"], ctx["sections"]
-    nav = [("front", "Front Page")] + [(k, v) for k, v, _, _ in SECTIONS if sections.get(k, ([], []))[0]]
+    nav = [("front", "Front Page")]
+    nav += [("watch", "Watchlist")] if ctx["watch"] else []
+    nav += [("lens", "CFA Lens")] if ctx["lens"] else []
+    short = {"economy": "Economy", "companies": "Companies"}  # the menu has to fit on one line
+    nav += [(k, short.get(k, v)) for k, v, _, _ in SECTIONS if sections.get(k, ([], []))[0]]
     nav += [("desk", "Regulators"), ("subs", "Subscriber Desk")]
 
     body = []
@@ -963,6 +1262,8 @@ def render(ctx, prefix, archived):
         row = "".join(story_html(c, today, img=True, kicker=SEC_NAME[c["section"]]) for c in front[4:8])
         body.append(f'<section id="front" class="front" data-sec><div class="front-top">{lead}'
                     f'<div class="front-side">{side}</div></div><div class="front-row">{row}</div></section>')
+    body.append(dash_html(ctx))
+    body.append(lens_html(ctx["lens"]))
     for sec, title, _, _ in SECTIONS:
         cards, briefs = sections.get(sec, ([], []))
         if not cards:
@@ -1016,12 +1317,12 @@ def render(ctx, prefix, archived):
 <head>
 {head}
 </head>
-<body data-built="{now.isoformat()}"{' data-archived="1"' if archived else ''}>
+<body data-built="{now.isoformat()}" data-root="{prefix}"{' data-archived="1"' if archived else ''}>
 <svg width="0" height="0" style="position:absolute"><symbol id="lk" viewBox="0 0 16 16"><path d="M5 7V5.2a3 3 0 0 1 6 0V7" fill="none" stroke="currentColor" stroke-width="1.7"/><rect x="3" y="7" width="10" height="8" rx="1.6" fill="currentColor"/></symbol></svg>
 <div class="stale" id="stale" hidden></div>
 {archive_note}
 <header class="mast">
-  <div class="mast-top"><span>Vol. I · No. {ctx["no"]}</span><span>{date_long}</span><span>Printed {printed} IST</span></div>
+  <div class="mast-top"><span>Vol. I · No. {ctx["no"]}</span><span>{date_long}{" · Evening edition" if ctx["edition"] == "Evening" else ""}</span><span>Printed {printed} IST</span></div>
   <h1 class="nameplate"><a href="{prefix}index.html">{nameplate()}</a></h1>
   <p class="motto">{MOTTO}</p>
   <div class="mast-bottom">{prev_link}<span class="tally">{len(read_ok)} publishers · {ctx["scanned"]:,} stories read · {ctx["printed"]} printed</span><span class="mast-r"><a href="{prefix}archive.html">All editions</a><button id="theme" type="button" aria-label="Switch light or dark">◐</button></span></div>
@@ -1042,7 +1343,7 @@ def render(ctx, prefix, archived):
   </div>
   <p class="colophon">Printed {date_long}, {printed} IST · {ctx["clusters"]:,} distinct stories found · Made by <a href="https://github.com/{AUTHOR}">{AUTHOR}</a> · <a href="{REPO_URL}">How it works</a></p>
 </footer>
-{market_panel_html(ctx["quotes"])}
+{market_panel_html(ctx["panel"])}
 <script>{JS}</script>
 </body>
 </html>
@@ -1097,7 +1398,7 @@ def main():
         return 0  # the logon / noon catch-up runs: today's paper is already out
     for attempt in range(5):
         now = datetime.now(IST)
-        items, desk, quotes, status, raw = collect(now)
+        items, desk, quotes, status, raw, extras = collect(now)
         ok = sum(1 for s in status.values() if s["ok"])
         if ok >= 6 or "--no-wait" in args:
             break
@@ -1117,22 +1418,52 @@ def main():
         index = {}
     earlier = sorted(d for d in index if d < stamp)
     printed = len(front) + sum(len(a) + len(b) for a, b in sections.values())
+
+    # Everything on the page, best first: the watchlist and the CFA Lens look for stories here.
+    ranked = front + [c for cards, briefs in sections.values() for c in cards + briefs]
+    watch, movers = extras["watch"], extras["movers"]
+    watch_news(watch, ranked)
+    lens = cfa_lens.pick([(c["primary"]["title"], c["primary"]["desc"], c) for c in ranked])
+    # One list behind the chart panel: the strip, then the watchlist, then the movers.
+    panel, panel_index = [], {}
+    for q in quotes + watch + ((movers["gainers"] + movers["losers"]) if movers else []):
+        if q["sym"] not in panel_index:
+            panel_index[q["sym"]] = len(panel)
+            panel.append(q)
+    edition = "Evening" if now.hour * 60 + now.minute >= 15 * 60 + 45 else "Morning"  # after the 3:30 PM close
+
     ctx = {"now": now, "today": today, "front": front, "sections": sections, "subs": subs, "desk": desk,
            "quotes": quotes, "status": status, "scanned": raw, "printed": printed, "clusters": n_clusters,
-           "no": len(earlier) + 1, "prev": earlier[-1] if earlier else None}
+           "no": len(earlier) + 1, "prev": earlier[-1] if earlier else None, "edition": edition,
+           "watch": watch, "movers": movers, "week": week_ahead(today), "lens": lens,
+           "panel": panel, "panel_index": panel_index}
 
     write(EDITIONS / f"{stamp}.html", render(ctx, "../", archived=True))
     write(ROOT / "index.html", render(ctx, "", archived=False))
-    index[stamp] = {"no": ctx["no"], "printed": printed,
+    write(ROOT / "sw.js", SERVICE_WORKER.replace("__VERSION__", now.strftime("%Y%m%d%H%M")))
+    index[stamp] = {"no": ctx["no"], "printed": printed, "edition": edition,
                     "lead": front[0]["primary"]["title"] if front else ""}
     write(index_path, json.dumps(index, indent=1))
     write(ROOT / "archive.html", render_archive(index))
     write(ROOT / "sitemap.xml", render_sitemap(index))
 
     failed = [k for k, s in status.items() if not s["ok"]]
-    log(f"printed edition No. {ctx['no']}: {printed} stories from {ok}/{len(status)} publishers, "
-        f"{raw} read, {n_clusters} distinct, {checked} paywall checks"
+    log(f"printed edition No. {ctx['no']} ({edition.lower()}): {printed} stories from {ok}/{len(status)} publishers, "
+        f"{raw} read, {n_clusters} distinct, {checked} paywall checks; watchlist {len(watch)}/{len(WATCHLIST)}, "
+        f"movers {'from ' + str(movers['count']) + ' stocks' if movers else 'unavailable'}, "
+        f"lens {len(lens)}, week ahead {len(ctx['week'])}"
         + (f"; no answer from {', '.join(failed)}" if failed else ""))
+    try:
+        events = json.loads((ROOT / "calendar.json").read_text(encoding="utf-8"))["events"]
+    except Exception:
+        events = []
+    for what, test in (("US data (BLS)", lambda e: e["tag"] == "US" and e["kind"] == "data"),
+                       ("RBI meetings", lambda e: e["title"].startswith("RBI")),
+                       ("Fed meetings", lambda e: e["title"].startswith("Fed")),
+                       ("NSE holidays", lambda e: e["kind"] == "holiday")):
+        last = max((e["date"] for e in events if test(e)), default="")
+        if last < (today + timedelta(days=30)).isoformat():
+            log(f"   calendar.json: {what} end {last or 'n/a'} - add the next official dates")
     for k, s in status.items():
         if s["errors"]:
             log(f"   {k}: {'; '.join(s['errors'][:2])}")
@@ -1262,9 +1593,9 @@ border-top:1px solid var(--hair)}
 .secnav{position:sticky;top:0;z-index:5;background:var(--bg);border-bottom:1px solid var(--rule)}
 .secnav-in{max-width:1280px;margin:0 auto;padding:0 16px;display:flex;align-items:center;gap:14px}
 @media(min-width:760px){.secnav-in{padding:0 32px}}
-.links{display:flex;gap:20px;overflow-x:auto;scrollbar-width:none;flex:1;min-width:0}
+.links{display:flex;gap:18px;overflow-x:auto;scrollbar-width:none;flex:1;min-width:0}
 .links::-webkit-scrollbar{display:none}
-.links a{font:600 11.5px/1 var(--sans);text-transform:uppercase;letter-spacing:.08em;text-decoration:none;
+.links a{font:600 11.5px/1 var(--sans);text-transform:uppercase;letter-spacing:.065em;text-decoration:none;
 padding:14px 0 12px;white-space:nowrap;border-bottom:2px solid transparent}
 .links a:hover{border-color:var(--accent)}
 .search input{font:14px var(--sans);background:var(--paper);border:1px solid var(--hair);color:var(--ink);
@@ -1338,6 +1669,62 @@ border-top:4px solid var(--rule);padding-top:8px;margin-bottom:18px}
 .brief-list li{break-inside:avoid;padding:7px 0;border-bottom:1px dotted var(--hair)}
 .brief-list li>a{text-decoration:none;font-weight:500;font-size:15.5px;line-height:1.3;display:block;margin-bottom:2px}
 
+/* watchlist · Nifty movers · week ahead */
+.dash{display:grid;gap:28px;padding:26px 0 20px;border-bottom:1px solid var(--rule)}
+.dash .sec-head h2,.lens .sec-head h2{font-size:25px}
+@media(min-width:760px) and (max-width:1079px){.dash{grid-template-columns:repeat(2,minmax(0,1fr));gap:28px 0}
+.dash-col:nth-child(odd){padding-right:26px}.dash-col:nth-child(even){padding-left:26px;border-left:1px solid var(--hair)}}
+@media(min-width:1080px){.dash{grid-template-columns:repeat(3,minmax(0,1fr));gap:0}
+.dash-col{padding:0 24px;border-left:1px solid var(--hair)}.dash-col:first-child{padding-left:0;border-left:0}
+.dash-col:last-child{padding-right:0}}
+.wl,.mv-list,.cal{list-style:none;margin:0;padding:0}
+.wl li{padding:8px 0;border-bottom:1px dotted var(--hair)}
+.wl li:last-child,.cal li:last-child{border-bottom:0}
+.wl-row{display:flex;align-items:baseline;gap:10px;text-decoration:none;color:inherit;font:600 15px/1.3 var(--sans)}
+.wl-name{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.wl-px{font-variant-numeric:tabular-nums}
+.wl-row .up,.wl-row .down,.wl-row .flat{font-size:12.5px;min-width:66px;text-align:right;font-variant-numeric:tabular-nums}
+.wl-row:hover .wl-name,.mv-row:hover .mv-name{text-decoration:underline;text-underline-offset:3px}
+.wl-line{margin:3px 0 0;font-size:13.5px;line-height:1.38;color:var(--ink2)}
+.wl-line a{text-decoration:none}.wl-line a:hover{text-decoration:underline}
+.wl-line a:visited{color:var(--visited)}
+.wl-quiet{color:var(--muted);font-style:italic;font-size:14px;margin:8px 0 0}
+.mv{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:0 20px}
+.mv-list li{border-bottom:1px dotted var(--hair)}
+.mv-row{display:flex;justify-content:space-between;align-items:baseline;gap:8px;padding:7px 0;text-decoration:none;
+color:inherit;font:600 13.5px/1.3 var(--sans)}
+.mv-name{min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.mv-row .up,.mv-row .down,.mv-row .flat{font-size:12.5px;flex:0 0 auto;font-variant-numeric:tabular-nums}
+.cal li{display:grid;grid-template-columns:44px minmax(0,1fr) auto;gap:12px;align-items:center;padding:8px 0;
+border-bottom:1px dotted var(--hair)}
+.cal-d{display:flex;flex-direction:column;align-items:center;line-height:1.08;font-family:var(--sans);
+border:1px solid var(--hair);border-radius:4px;padding:4px 0 5px;background:var(--paper)}
+.cal-d b{font-size:9.5px;letter-spacing:.08em;text-transform:uppercase;color:var(--accent)}
+.cal-d span{font-size:18px;font-weight:700}
+.cal-d small{font-size:9.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em}
+.cal-t b{display:block;font:600 14.5px/1.25 var(--sans)}
+.cal-t small{display:block;font:500 12.5px/1.35 var(--sans);color:var(--muted);margin-top:2px}
+.cal-holiday .cal-t b{color:var(--accent)}
+.cal-tag{font:700 10px var(--sans);letter-spacing:.08em;color:var(--muted);border:1px solid var(--hair);border-radius:3px;
+padding:2px 5px}
+
+/* the CFA Lens */
+.lens{padding:26px 0 22px;border-bottom:1px solid var(--rule)}
+.lens-grid{display:grid;gap:0}
+.lens-card+.lens-card{margin-top:18px;padding-top:18px;border-top:1px solid var(--hair)}
+@media(min-width:900px){.lens-grid{grid-template-columns:repeat(3,minmax(0,1fr))}
+.lens-card,.lens-card+.lens-card{margin:0;padding:0 22px;border-top:0;border-left:1px solid var(--hair)}
+.lens-card:first-child{padding-left:0;border-left:0}.lens-card:last-child{padding-right:0}}
+.lens-h{font:700 21px/1.2 var(--serif);margin:0 0 8px}
+.lens-news{font:500 13px/1.4 var(--sans);margin:0 0 9px;color:var(--ink2)}
+.lens-news span{display:block;font-weight:700;font-size:10px;letter-spacing:.09em;text-transform:uppercase;
+color:var(--muted);margin-bottom:2px}
+.lens-news a{text-decoration:none}.lens-news a:hover{text-decoration:underline}
+.lens-x{margin:0 0 10px;font-size:15.5px;line-height:1.48;color:var(--ink2)}
+.lens-angle{margin:0;padding:10px 12px;background:var(--wash);border-left:3px solid var(--accent);
+font:500 13.5px/1.45 var(--sans)}
+.lens-angle b{display:block;font-size:10px;letter-spacing:.09em;text-transform:uppercase;color:var(--accent);margin-bottom:3px}
+
 /* regulators + subscriber desk */
 .band{display:grid;gap:30px;padding:26px 0 18px;border-bottom:4px double var(--rule)}
 @media(min-width:960px){.band{grid-template-columns:minmax(0,4fr) minmax(0,8fr);gap:0}
@@ -1390,6 +1777,21 @@ JS = r"""
       '. Today’s paper is printed at about 6 AM India time — if it’s later than that, try reloading.';
     st.hidden=false;
   }
+  /* Offline mode: a service worker keeps the latest copy of each page you open. */
+  var rootPath=body.getAttribute('data-root')||'';
+  if('serviceWorker' in navigator && location.protocol==='https:'){
+    window.addEventListener('load',function(){navigator.serviceWorker.register(rootPath+'sw.js').catch(function(){})});
+  }
+  function offline(){
+    if(!st) return;
+    if(!navigator.onLine){
+      st.textContent='You’re offline, so this is the copy saved on your device (printed '+
+        built.toLocaleString(undefined,{weekday:'short',day:'numeric',month:'short',hour:'numeric',minute:'2-digit'})+').';
+      st.hidden=false;
+    } else if(st.textContent.indexOf('offline')>-1){ st.hidden=true; }
+  }
+  offline();
+  window.addEventListener('offline',offline); window.addEventListener('online',offline);
   var q=document.getElementById('q'), qn=document.getElementById('qn');
   if(!q) return;
   var items=[].slice.call(document.querySelectorAll('[data-s]'));
@@ -1427,9 +1829,13 @@ JS = r"""
     if(k==='yield') return num(v,2)+'%';
     if(k==='fx') return '₹'+num(v,2);
     if(k==='usd') return '$'+num(v,v<1000?2:0);
+    if(k==='usd2') return '$'+num(v,2);
+    if(k==='inr') return '₹'+num(v,2);
     return num(v,2);
   }
-  function tick(v,k,d){return k==='yield'?v.toFixed(d)+'%':k==='usd'?'$'+num(v,d):num(v,d)}
+  function tick(v,k,d){
+    return k==='yield'?v.toFixed(d)+'%':(k==='usd'||k==='usd2')?'$'+num(v,d):k==='inr'?'₹'+num(v,d):num(v,d);
+  }
   function move(a,b,k){
     var up=a>b, dn=a<b, arrow=up?'▲ ':dn?'▼ ':'● ';
     var t=k==='yield'?Math.abs(Math.round((a-b)*100))+' bp':Math.abs((a/b-1)*100).toFixed(2)+'%';
@@ -1575,7 +1981,7 @@ JS = r"""
     setRange(range);
     try{history.replaceState(null,'','#'+Q[cur].id)}catch(e){}
   }
-  document.querySelectorAll('a.tk[data-i]').forEach(function(a){
+  document.querySelectorAll('a[data-i]').forEach(function(a){
     a.addEventListener('click',function(e){
       e.preventDefault(); var i=+a.getAttribute('data-i');
       if(dlg.showModal) open(i); else window.open(Q[i].url,'_blank','noopener');
