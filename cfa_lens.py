@@ -228,10 +228,11 @@ for _c in CONCEPTS:
     _c["rx"] = re.compile("|".join(_c["match"]), re.I)
 
 
-def pick(stories, n=3):
+def pick(stories, n=3, concepts=None, exclude=()):
     """stories: [(title, dek, story)] ranked best first -> [(concept, story)], distinct concepts,
-    trying for distinct topic areas first."""
-    chosen, used, topics, seen = [], set(), set(), set()
+    trying for distinct topic areas first. `exclude`: stories already used elsewhere."""
+    concepts = CONCEPTS if concepts is None else concepts
+    chosen, used, topics, seen = [], set(), set(), {id(s) for s in exclude}
     for strict in (True, False):
         for title, dek, story in stories:
             if len(chosen) == n:
@@ -239,7 +240,7 @@ def pick(stories, n=3):
             if id(story) in seen:
                 continue
             text = f"{title} {dek}"
-            for c in CONCEPTS:
+            for c in concepts:
                 if c["title"] in used or (strict and c["topic"] in topics):
                     continue
                 if c["rx"].search(text):

@@ -36,6 +36,7 @@ from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 
+import ca_lens
 import cfa_lens
 
 ROOT = Path(__file__).resolve().parent
@@ -1094,22 +1095,25 @@ def dash_html(ctx):
     return f'<section class="dash">{"".join(cols)}</section>' if cols else ""
 
 
-def lens_html(picks):
-    """The CFA Lens: today's stories next to the Level I concept each one illustrates."""
-    if not picks:
+def lens_html(cfa, ca):
+    """The CFA & CA Lens: today's stories next to the exam concept each one illustrates."""
+    def row(picks, exam, tag):
+        cards = []
+        for c, story in picks:
+            p = story["primary"]
+            cards.append(
+                f'<article class="lens-card" data-s="{esc((c["title"] + " " + c["topic"] + " " + p["title"] + " " + tag).lower())}">'
+                f'<p class="kicker">{esc(c["topic"])}</p><h3 class="lens-h">{esc(c["title"])}</h3>'
+                f'<p class="lens-news"><span>In the news</span><a href="{esc(p["link"])}" target="_blank" rel="noopener">'
+                f'{esc(p["title"])}</a></p><p class="lens-x">{esc(c["explain"])}</p>'
+                f'<p class="lens-angle"><b>Exam angle</b>{esc(c["angle"])}</p></article>')
+        return (f'<div class="lens-row"><h3 class="lens-exam">{exam}</h3><div class="lens-grid">{"".join(cards)}</div></div>'
+                if cards else "")
+    if not cfa and not ca:
         return ""
-    cards = []
-    for c, story in picks:
-        p = story["primary"]
-        cards.append(
-            f'<article class="lens-card" data-s="{esc((c["title"] + " " + c["topic"] + " " + p["title"] + " cfa").lower())}">'
-            f'<p class="kicker">{esc(c["topic"])}</p><h3 class="lens-h">{esc(c["title"])}</h3>'
-            f'<p class="lens-news"><span>In the news</span><a href="{esc(p["link"])}" target="_blank" rel="noopener">'
-            f'{esc(p["title"])}</a></p><p class="lens-x">{esc(c["explain"])}</p>'
-            f'<p class="lens-angle"><b>Exam angle</b>{esc(c["angle"])}</p></article>')
-    return (f'<section class="lens" id="lens" data-sec><header class="sec-head"><h2>The CFA Lens</h2>'
-            f'<span class="sec-note">Today’s news, exam-style · CFA Level I</span></header>'
-            f'<div class="lens-grid">{"".join(cards)}</div></section>')
+    return (f'<section class="lens" id="lens" data-sec><header class="sec-head"><h2>The CFA &amp; CA Lens</h2>'
+            f'<span class="sec-note">Today’s news, exam-style</span></header>'
+            f'{row(cfa, "CFA Level I", "cfa")}{row(ca, "CA · ICAI", "ca icai")}</section>')
 
 
 # The service worker behind offline mode: pages come from the network when there is one (and are
@@ -1248,7 +1252,7 @@ def render(ctx, prefix, archived):
     front, sections = ctx["front"], ctx["sections"]
     nav = [("front", "Front Page")]
     nav += [("watch", "Watchlist")] if ctx["watch"] else []
-    nav += [("lens", "CFA Lens")] if ctx["lens"] else []
+    nav += [("lens", "CFA & CA")] if ctx["lens"] or ctx["lens_ca"] else []
     short = {"economy": "Economy", "companies": "Companies"}  # the menu has to fit on one line
     nav += [(k, short.get(k, v)) for k, v, _, _ in SECTIONS if sections.get(k, ([], []))[0]]
     nav += [("desk", "Regulators"), ("subs", "Subscriber Desk")]
@@ -1262,7 +1266,7 @@ def render(ctx, prefix, archived):
         body.append(f'<section id="front" class="front" data-sec><div class="front-top">{lead}'
                     f'<div class="front-side">{side}</div></div><div class="front-row">{row}</div></section>')
     body.append(dash_html(ctx))
-    body.append(lens_html(ctx["lens"]))
+    body.append(lens_html(ctx["lens"], ctx["lens_ca"]))
     for sec, title, _, _ in SECTIONS:
         cards, briefs = sections.get(sec, ([], []))
         if not cards:
@@ -1422,7 +1426,9 @@ def main():
     ranked = front + [c for cards, briefs in sections.values() for c in cards + briefs]
     watch, movers = extras["watch"], extras["movers"]
     watch_news(watch, ranked)
-    lens = cfa_lens.pick([(c["primary"]["title"], c["primary"]["desc"], c) for c in ranked])
+    stories = [(c["primary"]["title"], c["primary"]["desc"], c) for c in ranked]
+    lens = cfa_lens.pick(stories)
+    lens_ca = ca_lens.pick(stories, exclude=[s for _, s in lens])  # different stories from the CFA side
     # One list behind the chart panel: the strip, then the watchlist, then the movers.
     panel, panel_index = [], {}
     for q in quotes + watch + ((movers["gainers"] + movers["losers"]) if movers else []):
@@ -1434,7 +1440,7 @@ def main():
     ctx = {"now": now, "today": today, "front": front, "sections": sections, "subs": subs, "desk": desk,
            "quotes": quotes, "status": status, "scanned": raw, "printed": printed, "clusters": n_clusters,
            "no": len(earlier) + 1, "prev": earlier[-1] if earlier else None, "edition": edition,
-           "watch": watch, "movers": movers, "week": week_ahead(today), "lens": lens,
+           "watch": watch, "movers": movers, "week": week_ahead(today), "lens": lens, "lens_ca": lens_ca,
            "panel": panel, "panel_index": panel_index}
 
     write(EDITIONS / f"{stamp}.html", render(ctx, "../", archived=True))
@@ -1450,7 +1456,7 @@ def main():
     log(f"printed edition No. {ctx['no']} ({edition.lower()}): {printed} stories from {ok}/{len(status)} publishers, "
         f"{raw} read, {n_clusters} distinct, {checked} paywall checks; watchlist {len(watch)}/{len(WATCHLIST)}, "
         f"movers {'from ' + str(movers['count']) + ' stocks' if movers else 'unavailable'}, "
-        f"lens {len(lens)}, week ahead {len(ctx['week'])}"
+        f"lens {len(lens)} CFA + {len(lens_ca)} CA, week ahead {len(ctx['week'])}"
         + (f"; no answer from {', '.join(failed)}" if failed else ""))
     try:
         events = json.loads((ROOT / "calendar.json").read_text(encoding="utf-8"))["events"]
@@ -1715,6 +1721,10 @@ padding:2px 5px}
 .lens-card,.lens-card+.lens-card{margin:0;padding:0 22px;border-top:0;border-left:1px solid var(--hair)}
 .lens-card:first-child{padding-left:0;border-left:0}.lens-card:last-child{padding-right:0}}
 .lens-h{font:700 21px/1.2 var(--serif);margin:0 0 8px}
+.lens-exam{font:700 11px/1.3 var(--sans);letter-spacing:.12em;text-transform:uppercase;color:var(--ink);
+margin:0 0 12px;display:flex;align-items:center;gap:10px}
+.lens-exam::after{content:"";flex:1;border-top:1px solid var(--hair)}
+.lens-row+.lens-row{margin-top:26px}
 .lens-news{font:500 13px/1.4 var(--sans);margin:0 0 9px;color:var(--ink2)}
 .lens-news span{display:block;font-weight:700;font-size:10px;letter-spacing:.09em;text-transform:uppercase;
 color:var(--muted);margin-bottom:2px}
