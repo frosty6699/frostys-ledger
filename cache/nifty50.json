@@ -4,6 +4,7 @@
  "APOLLOHOSP": "Apollo Hospitals",
  "ASIANPAINT": "Asian Paints",
  "AXISBANK": "Axis Bank",
+ "BSE": "BSE",
  "BAJAJ-AUTO": "Bajaj Auto",
  "BAJFINANCE": "Bajaj Finance",
  "BAJAJFINSV": "Bajaj Finserv",
@@ -47,6 +48,5 @@
  "TECHM": "Tech Mahindra",
  "TITAN": "Titan",
  "TRENT": "Trent",
- "ULTRACEMCO": "UltraTech Cement",
- "WIPRO": "Wipro"
+ "ULTRACEMCO": "UltraTech Cement"
 }
