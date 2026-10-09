@@ -23,6 +23,7 @@ What's in it:
   holidays.
 - **The CFA Lens:** three of the day's stories next to the CFA Level I concept each one illustrates,
   with the exam angle.
+- **Insights:** the week's long reads from McKinsey, BCG, Bain and HBR (two per firm; HBR is metered, so it carries a 🔒).
 - **Regulators:** the latest RBI and US Fed press releases.
 - **Subscriber Desk:** nothing gets around a paywall. Subscriber-only stories (WSJ, FT, Bloomberg,
   ET Prime, Mint Premium and others) appear here with only the headline and summary the publisher

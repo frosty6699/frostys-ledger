@@ -160,6 +160,16 @@ WATCHLIST = [
     ("Citigroup", "C", "usd2", [r"\bciti(group|bank)?\b"]),
 ]
 
+# The Insights shelf: long reads, kept out of the news ranking. key, name, feed, behind a paywall.
+# BCG, Bain and HBR come through Google News (their own feeds are blocked, missing or empty).
+INSIGHTS = [
+    ("McKinsey", "McKinsey & Company", "https://www.mckinsey.com/insights/rss", False),
+    ("BCG", "Boston Consulting Group", GN.format("when:14d+site:bcg.com/publications"), False),
+    ("Bain", "Bain & Company", GN.format("when:14d+site:bain.com/insights"), False),
+    ("HBR", "Harvard Business Review", GN.format("when:14d+site:hbr.org"), True),
+]
+DROP_INSIGHT = re.compile(r"podcast|webinar|\bvideo\b|\bevents?\b|careers?|press release|newsletter", re.I)
+
 SECTIONS = [  # id, title, story cards, one-line briefs
     ("markets", "Markets", 7, 10),
     ("economy", "Economy & Policy", 7, 10),
@@ -593,10 +603,12 @@ def check_paywalls(items):
 def collect(now):
     with ThreadPoolExecutor(20) as ex:
         movers_job = ex.submit(fetch_movers)
+        insights_job = ex.submit(fetch_insights, now)
         feeds = list(ex.map(load_source, SOURCES))
         quotes = [q for q in ex.map(fetch_quote, TICKERS) if q]
         watch = [q for q in ex.map(fetch_quote, WATCHLIST) if q]
         movers = movers_job.result()
+        insights = insights_job.result()
     status, items, desk, seen = {}, [], defaultdict(list), set()
     window = now - timedelta(hours=30)
     raw_count = 0
@@ -647,7 +659,7 @@ def collect(now):
             status[key]["n"] += 1
     for key in desk:
         desk[key].sort(key=lambda d: d["date"], reverse=True)
-    return items, desk, quotes, status, raw_count, {"watch": watch, "movers": movers}
+    return items, desk, quotes, status, raw_count, {"watch": watch, "movers": movers, "insights": insights}
 
 
 def similar(a, b):
@@ -1095,6 +1107,60 @@ def dash_html(ctx):
     return f'<section class="dash">{"".join(cols)}</section>' if cols else ""
 
 
+def fetch_insights(now, per_source=2, most=8):
+    """The latest long reads: two per source at most, newest first, from the last week
+    (two weeks if the week was quiet)."""
+    found, seen = [], set()
+    for key, name, url, paid in INSIGHTS:
+        try:
+            entries = feed_entries(parse_xml(fetch(url)))
+        except Exception:
+            continue
+        via_google = url.startswith("https://news.google.com")
+        for e in entries:
+            title = clean(e["title"])
+            if via_google:
+                title = re.sub(r"\s+-\s+[^-]{2,40}$", "", title)
+            if not title or DROP_INSIGHT.search(title) or title.lower() in seen:
+                continue
+            seen.add(title.lower())
+            found.append({"src": key, "name": name, "title": title, "link": (e["link"] or "").strip(),
+                          "desc": "" if via_google else trim_dek(clean(e["desc"]), title, 190),
+                          "date": min(e["date"] or now, now), "paid": paid})
+    found.sort(key=lambda r: r["date"], reverse=True)
+    picked = []
+    for days in (7, 14):
+        recent = [r for r in found if r["date"] >= now - timedelta(days=days)]
+        picked, count = [], Counter()
+        for r in recent:
+            if count[r["src"]] < per_source and len(picked) < most:
+                picked.append(r)
+                count[r["src"]] += 1
+        if len(picked) >= 6:
+            break
+    return picked
+
+
+def insights_html(rows, now):
+    """The Insights shelf: strategy and management reads from consulting firms and HBR."""
+    if not rows:
+        return ""
+    today = now.date()
+    cards = []
+    for r in rows:
+        new = '<span class="ins-new">New</span>' if r["date"] >= now - timedelta(hours=30) else ""
+        lock = LOCK_SVG if r["paid"] else ""
+        dek = f'<p class="dek">{esc(r["desc"])}</p>' if r["desc"] else ""
+        search = (r["title"] + " " + r["desc"] + " " + r["name"] + " " + r["src"] + " insights").lower()
+        cards.append(f'<article class="ins-card" data-s="{esc(search)}">'
+                     f'<p class="ins-firm"><span>{esc(r["name"])}{lock}</span>{new}</p>'
+                     f'<h3 class="hl"><a href="{esc(r["link"])}" target="_blank" rel="noopener">{esc(r["title"])}</a></h3>'
+                     f'{dek}<p class="meta"><time>{fmt_time(r["date"], today)}</time></p></article>')
+    return (f'<section class="ins" id="insights" data-sec><header class="sec-head"><h2>Insights</h2>'
+            f'<span class="sec-note">Long reads from McKinsey, BCG, Bain &amp; HBR</span></header>'
+            f'<div class="ins-grid">{"".join(cards)}</div></section>')
+
+
 def lens_html(cfa, ca):
     """The CFA & CA Lens: today's stories next to the exam concept each one illustrates."""
     def row(picks, exam, tag):
@@ -1253,9 +1319,10 @@ def render(ctx, prefix, archived):
     nav = [("front", "Front Page")]
     nav += [("watch", "Watchlist")] if ctx["watch"] else []
     nav += [("lens", "CFA & CA")] if ctx["lens"] or ctx["lens_ca"] else []
-    short = {"economy": "Economy", "companies": "Companies"}  # the menu has to fit on one line
+    short = {"economy": "Economy", "companies": "Companies", "tech": "Tech"}  # the menu has to fit on one line
     nav += [(k, short.get(k, v)) for k, v, _, _ in SECTIONS if sections.get(k, ([], []))[0]]
-    nav += [("desk", "Regulators"), ("subs", "Subscriber Desk")]
+    nav += [("insights", "Insights")] if ctx["insights"] else []
+    nav += [("desk", "Regulators"), ("subs", "Subscribers")]
 
     body = []
     if front:
@@ -1282,6 +1349,7 @@ def render(ctx, prefix, archived):
         body.append(f'<section id="{sec}" class="sec" data-sec><header class="sec-head"><h2>{esc(title)}</h2>'
                     f'<span class="sec-note">{count} stories</span></header>'
                     f'<div class="sec-body">{feat}{rest}</div>{br}</section>')
+    body.append(insights_html(ctx["insights"], now))
     body.append(f'<section class="band"><div id="desk" class="reg" data-sec><header class="sec-head">'
                 f'<h2>From the Regulators</h2><span class="sec-note">Official releases</span></header>'
                 f'{desk_html(ctx["desk"], today)}</div>'
@@ -1440,7 +1508,7 @@ def main():
     ctx = {"now": now, "today": today, "front": front, "sections": sections, "subs": subs, "desk": desk,
            "quotes": quotes, "status": status, "scanned": raw, "printed": printed, "clusters": n_clusters,
            "no": len(earlier) + 1, "prev": earlier[-1] if earlier else None, "edition": edition,
-           "watch": watch, "movers": movers, "week": week_ahead(today), "lens": lens, "lens_ca": lens_ca,
+           "watch": watch, "movers": movers, "week": week_ahead(today), "lens": lens, "lens_ca": lens_ca, "insights": extras["insights"],
            "panel": panel, "panel_index": panel_index}
 
     write(EDITIONS / f"{stamp}.html", render(ctx, "../", archived=True))
@@ -1456,7 +1524,7 @@ def main():
     log(f"printed edition No. {ctx['no']} ({edition.lower()}): {printed} stories from {ok}/{len(status)} publishers, "
         f"{raw} read, {n_clusters} distinct, {checked} paywall checks; watchlist {len(watch)}/{len(WATCHLIST)}, "
         f"movers {'from ' + str(movers['count']) + ' stocks' if movers else 'unavailable'}, "
-        f"lens {len(lens)} CFA + {len(lens_ca)} CA, week ahead {len(ctx['week'])}"
+        f"lens {len(lens)} CFA + {len(lens_ca)} CA, insights {len(extras['insights'])}, week ahead {len(ctx['week'])}"
         + (f"; no answer from {', '.join(failed)}" if failed else ""))
     try:
         events = json.loads((ROOT / "calendar.json").read_text(encoding="utf-8"))["events"]
@@ -1604,7 +1672,7 @@ border-top:1px solid var(--hair)}
 padding:14px 0 12px;white-space:nowrap;border-bottom:2px solid transparent}
 .links a:hover{border-color:var(--accent)}
 .search input{font:14px var(--sans);background:var(--paper);border:1px solid var(--hair);color:var(--ink);
-padding:6px 10px;border-radius:3px;width:190px}
+padding:6px 10px;border-radius:3px;width:160px}
 .qn{font:600 11px var(--sans);color:var(--accent);white-space:nowrap}
 .qn:empty{display:none}
 @media(max-width:640px){.search input{width:104px}}
@@ -1733,6 +1801,24 @@ color:var(--muted);margin-bottom:2px}
 .lens-angle{margin:0;padding:10px 12px;background:var(--wash);border-left:3px solid var(--accent);
 font:500 13.5px/1.45 var(--sans)}
 .lens-angle b{display:block;font-size:10px;letter-spacing:.09em;text-transform:uppercase;color:var(--accent);margin-bottom:3px}
+
+/* insights */
+.ins{padding:26px 0 18px;border-bottom:1px solid var(--rule)}
+.ins .sec-head h2{font-size:25px}
+.ins-grid{display:grid}
+.ins-card+.ins-card{margin-top:14px;padding-top:14px;border-top:1px solid var(--hair)}
+@media(min-width:700px) and (max-width:1079px){.ins-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:22px 0}
+.ins-card,.ins-card+.ins-card{margin:0;padding:0 0 0 24px;border-top:0;border-left:1px solid var(--hair)}
+.ins-card:nth-child(odd){padding:0 24px 0 0;border-left:0}}
+@media(min-width:1080px){.ins-grid{grid-template-columns:repeat(4,minmax(0,1fr));gap:24px 0}
+.ins-card,.ins-card+.ins-card{margin:0;padding:0 20px;border-top:0;border-left:1px solid var(--hair)}
+.ins-card:nth-child(4n+1){padding-left:0;border-left:0}.ins-card:nth-child(4n){padding-right:0}}
+.ins-firm{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:0 0 6px;
+font:700 10.5px/1.3 var(--sans);letter-spacing:.1em;text-transform:uppercase;color:var(--accent)}
+.ins-firm .lock{color:var(--lock)}
+.ins-new{background:var(--accent);color:var(--paper);border-radius:3px;padding:2px 6px;font-size:9px;letter-spacing:.08em}
+.ins-card .hl{font-size:18px;line-height:1.25}
+.ins-card .dek{font-size:14.5px}
 
 /* regulators + subscriber desk */
 .band{display:grid;gap:30px;padding:26px 0 18px;border-bottom:4px double var(--rule)}
