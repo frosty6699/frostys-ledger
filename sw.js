@@ -1,4 +1,4 @@
-const V = '202611111230';
+const V = '202611120013';
 const PAGES = 'ledger-pages', ASSETS = 'ledger-assets-' + V, IMGS = 'ledger-img', FONTS = 'ledger-fonts';
 self.addEventListener('install', e => {
   self.skipWaiting();
